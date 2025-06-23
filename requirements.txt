@@ -1,0 +1,8 @@
+pandas
+psycopg2
+SQLAlchemy
+python-telegram-bot==20.0
+scikit-learn
+xgboost
+joblib
+flask
