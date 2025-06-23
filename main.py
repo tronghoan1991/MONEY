@@ -3,7 +3,7 @@ import pandas as pd
 import psycopg2
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
 )
 from datetime import datetime
 import re
@@ -49,15 +49,27 @@ threading.Thread(target=start_flask, daemon=True).start()
 def create_table():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
-    # Thêm cột bot_predict nếu chưa có
+    # Tạo bảng nếu chưa có
     cur.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id SERIAL PRIMARY KEY,
             input TEXT,
             actual TEXT,
-            bot_predict TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
+    """)
+    # Thêm cột bot_predict nếu chưa có
+    cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='history' AND column_name='bot_predict'
+            ) THEN
+                ALTER TABLE history ADD COLUMN bot_predict TEXT;
+            END IF;
+        END
+        $$;
     """)
     conn.commit()
     cur.close()
@@ -204,7 +216,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) > 0 and df.iloc[-1]['bot_predict']:
         last_predict = df.iloc[-1]['bot_predict']
     else:
-        # Nếu không có bot_predict ở dòng cuối, tự dự đoán lại
         df_feat = make_features(df)
         models = load_models()
         if models is not None:
@@ -238,7 +249,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bao_proba, bao_probs = predict_stacking(X_pred, models, 'bao')
     bao_pct = round(bao_proba*100,2)
 
-    # Lưu lại dự đoán vào DB để so sánh đúng/sai
     insert_result("BOT_PREDICT", None, tx)
 
     so_du_doan, dung, sai, tile = summary_stats(df)
