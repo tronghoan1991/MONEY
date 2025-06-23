@@ -2,7 +2,9 @@ import os
 import pandas as pd
 import psycopg2
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+)
 from datetime import datetime
 import re
 import joblib
@@ -47,11 +49,13 @@ threading.Thread(target=start_flask, daemon=True).start()
 def create_table():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
+    # Thêm cột bot_predict nếu chưa có
     cur.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id SERIAL PRIMARY KEY,
             input TEXT,
             actual TEXT,
+            bot_predict TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
     """)
@@ -59,23 +63,37 @@ def create_table():
     cur.close()
     conn.close()
 
-def insert_result(input_str, actual):
+def insert_result(input_str, actual, bot_predict=None):
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     now = datetime.now()
-    cur.execute(
-        "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s);",
-        (input_str, actual, now)
-    )
+    if bot_predict is not None:
+        cur.execute(
+            "INSERT INTO history (input, actual, bot_predict, created_at) VALUES (%s, %s, %s, %s);",
+            (input_str, actual, bot_predict, now)
+        )
+    else:
+        cur.execute(
+            "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s);",
+            (input_str, actual, now)
+        )
     conn.commit()
     cur.close()
     conn.close()
 
 def fetch_history(limit=10000):
     conn = psycopg2.connect(DATABASE_URL)
-    df = pd.read_sql("SELECT input, actual, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, conn)
+    df = pd.read_sql("SELECT input, actual, bot_predict, created_at FROM history ORDER BY id ASC LIMIT %s" % limit, conn)
     conn.close()
     return df
+
+def delete_all_history():
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("TRUNCATE TABLE history;")
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def make_features(df):
     df = df.copy()
@@ -101,7 +119,6 @@ def train_models(df):
     models = {}
     for key, y in [('tx', y_tx), ('cl', y_cl), ('bao', y_bao)]:
         if len(set(y)) < 2:
-            # Không đủ 2 class, bỏ qua train, trả None
             models[key] = None
             continue
         lr = LogisticRegression().fit(X, y)
@@ -117,7 +134,6 @@ def load_models():
 
 def predict_stacking(X_pred, models, key):
     if models[key] is None:
-        # Trả về xác suất default và cảnh báo
         return 0.5, [0.5, 0.5, 0.5]
     lr, rf, xgbc = models[key]
     prob_lr = lr.predict_proba(X_pred)[0][1]
@@ -127,14 +143,15 @@ def predict_stacking(X_pred, models, key):
     return probs.mean(), probs
 
 def summary_stats(df):
-    num = len(df)
-    if num == 0:
+    if 'bot_predict' in df.columns:
+        df_pred = df[df['bot_predict'].notnull()]
+        so_du_doan = len(df_pred)
+        dung = (df_pred['bot_predict'] == df_pred['actual']).sum()
+        sai = so_du_doan - dung
+        tile = round((dung / so_du_doan) * 100, 2) if so_du_doan else 0
+        return so_du_doan, dung, sai, tile
+    else:
         return 0, 0, 0, 0
-    so_du_doan = num
-    dung = 0
-    sai = 0
-    tile = 0
-    return so_du_doan, dung, sai, tile
 
 def suggest_best_totals(df, prediction):
     if prediction not in ("Tài", "Xỉu") or df.empty:
@@ -153,9 +170,24 @@ def suggest_best_totals(df, prediction):
         return "-"
     return f"{min(best)}–{max(best)}"
 
+# ==== HANDLERS ====
+PENDING_RESET = {}
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip()
     create_table()
+    # Xác nhận lệnh reset
+    if user_id in PENDING_RESET and PENDING_RESET[user_id]:
+        if text.upper() == "XÓA HẾT":
+            delete_all_history()
+            PENDING_RESET[user_id] = False
+            await update.message.reply_text("✅ Đã xóa toàn bộ dữ liệu lịch sử.")
+        else:
+            PENDING_RESET[user_id] = False
+            await update.message.reply_text("❌ Hủy thao tác xóa.")
+        return
+
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
     if not (m or m2):
@@ -165,7 +197,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     total = sum(numbers)
     actual = "Tài" if total >= 11 else "Xỉu"
-    insert_result(input_str, actual)
+
+    # Lấy dự đoán gần nhất (nếu có)
+    df = fetch_history(10000)
+    last_predict = None
+    if len(df) > 0 and df.iloc[-1]['bot_predict']:
+        last_predict = df.iloc[-1]['bot_predict']
+    else:
+        # Nếu không có bot_predict ở dòng cuối, tự dự đoán lại
+        df_feat = make_features(df)
+        models = load_models()
+        if models is not None:
+            X_pred = df_feat.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+            tx_proba, _ = predict_stacking(X_pred, models, 'tx')
+            last_predict = "Tài" if tx_proba >= 0.5 else "Xỉu"
+
+    insert_result(input_str, actual, last_predict)
+
+    # Train và dự đoán phiên tiếp theo
     df = fetch_history(10000)
     df_feat = make_features(df)
     if len(df) >= MIN_BATCH:
@@ -188,6 +237,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dai_diem = suggest_best_totals(df, tx)
     bao_proba, bao_probs = predict_stacking(X_pred, models, 'bao')
     bao_pct = round(bao_proba*100,2)
+
+    # Lưu lại dự đoán vào DB để so sánh đúng/sai
+    insert_result("BOT_PREDICT", None, tx)
+
     so_du_doan, dung, sai, tile = summary_stats(df)
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
@@ -209,11 +262,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('\n'.join(lines))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Đây là Sicbo ML Bot.\n"
-        "- Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model.\n"
-        "- Gõ /predict để nhận dự đoán phiên tiếp theo."
+    msg = (
+        "🤖 Chào mừng đến với Sicbo ML Bot!\n\n"
+        "Các lệnh hỗ trợ:\n"
+        "/start – Xem hướng dẫn và danh sách lệnh\n"
+        "/predict – Dự đoán phiên tiếp theo\n"
+        "/stats – Thống kê hiệu suất dự đoán\n"
+        "/reset – Xóa toàn bộ lịch sử data (cần xác nhận)\n\n"
+        "Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model."
     )
+    await update.message.reply_text(msg)
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000)
@@ -237,6 +295,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dai_diem = suggest_best_totals(df, tx)
     bao_proba, _ = predict_stacking(X_pred, models, 'bao')
     bao_pct = round(bao_proba*100,2)
+    insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(df)
     lines = []
     if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
@@ -256,11 +315,33 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
     await update.message.reply_text('\n'.join(lines))
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df = fetch_history(10000)
+    so_du_doan, dung, sai, tile = summary_stats(df)
+    msg = (
+        f"BOT đã dự đoán: {so_du_doan} phiên\n"
+        f"Đúng: {dung}\n"
+        f"Sai: {sai}\n"
+        f"Tỉ lệ đúng: {tile}%"
+    )
+    await update.message.reply_text(msg)
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    PENDING_RESET[user_id] = True
+    await update.message.reply_text(
+        "⚠️ Bạn có chắc chắn muốn xóa toàn bộ lịch sử data? "
+        "Nếu chắc chắn, reply: XÓA HẾT\n"
+        "Nếu không, nhập bất kỳ ký tự nào khác để hủy."
+    )
+
 def main():
     create_table()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("predict", predict))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
