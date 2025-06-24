@@ -93,12 +93,12 @@ def fetch_history(limit=10000):
     # Sử dụng SQLAlchemy để tránh warning pandas!
     engine = create_engine(DATABASE_URL)
     df = pd.read_sql(
-        "SELECT input, actual, bot_predict, created_at FROM history ORDER BY id ASC LIMIT %s" % limit,
+        "SELECT id, input, actual, bot_predict, created_at FROM history ORDER BY id ASC LIMIT %s" % limit,
         engine
     )
     engine.dispose()
     # Chỉ lấy các dòng input là 3 số
-    df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False)]
+    df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False) | (df['input'] == "BOT_PREDICT")]
     return df
 
 def delete_all_history():
@@ -153,7 +153,7 @@ def load_models():
 
 def summary_stats(df):
     if 'bot_predict' in df.columns:
-        df_pred = df[df['bot_predict'].notnull()]
+        df_pred = df[(df['bot_predict'].notnull()) & (df['actual'].notnull())]
         so_du_doan = len(df_pred)
         dung = (df_pred['bot_predict'] == df_pred['actual']).sum()
         sai = so_du_doan - dung
@@ -166,7 +166,7 @@ def suggest_best_totals(df, prediction):
     if prediction not in ("Tài", "Xỉu") or df.empty:
         return "-"
     recent = df.tail(ROLLING_WINDOW)
-    totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s]
+    totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s and s != "BOT_PREDICT"]
     if prediction == "Tài":
         eligible = [t for t in range(11, 19)]
     else:
@@ -283,7 +283,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) > 0 and df.iloc[-1]['bot_predict']:
         last_predict = df.iloc[-1]['bot_predict']
 
-    insert_result(input_str, actual, last_predict)
+    # ======= ĐÂY LÀ PHẦN SỬA LỖI ĐÚNG/SAI =========
+    # Nếu dòng cuối là BOT_PREDICT và chưa có actual, cập nhật luôn actual vào dòng này
+    if len(df) > 0 and df.iloc[-1]['input'] == "BOT_PREDICT" and (df.iloc[-1]['actual'] is None or pd.isnull(df.iloc[-1]['actual'])):
+        # Tìm id dòng này để update
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        last_id = int(df.iloc[-1]['id'])
+        cur.execute("UPDATE history SET actual=%s WHERE id=%s;", (actual, last_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+    else:
+        insert_result(input_str, actual, last_predict)
+    # ======= HẾT PHẦN SỬA LỖI =========
 
     # Đọc lại lịch sử thực tế
     df = fetch_history(10000)
@@ -292,7 +305,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df_session = df[df['created_at'] >= session_start]
     else:
         df_session = df
-    if len(df_session) < MIN_SESSION_INPUT:
+    if len(df_session[df_session['input'] != "BOT_PREDICT"]) < MIN_SESSION_INPUT:
         await update.message.reply_text(f"Bạn cần nhập tối đa {MIN_SESSION_INPUT} phiên mới (sau khi bắt đầu session) để bot bắt đầu dự đoán trend session hiện tại!")
         return
 
@@ -380,7 +393,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df_session = df[df['created_at'] >= session_start]
     else:
         df_session = df
-    if len(df_session) < MIN_SESSION_INPUT:
+    if len(df_session[df_session['input'] != "BOT_PREDICT"]) < MIN_SESSION_INPUT:
         await update.message.reply_text(f"Bạn cần nhập tối đa {MIN_SESSION_INPUT} phiên mới (sau khi bắt đầu session) để bot bắt đầu dự đoán trend session hiện tại!")
         return
     df_feat = make_features(df)
