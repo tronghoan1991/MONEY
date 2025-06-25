@@ -22,8 +22,7 @@ import traceback
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Các tham số tùy chỉnh
-ROLLING_WINDOW = 12        # Rolling window nhỏ để bắt trend nhanh
+ROLLING_WINDOW = 12        # Rolling nhỏ để BOT bắt trend, đảo cầu nhanh
 MIN_BATCH = 5
 PROBA_CUTOFF = 0.62
 PROBA_ALERT = 0.75
@@ -109,7 +108,7 @@ def delete_all_history():
     cur.close()
     conn.close()
 
-# ==== FEATURE ENGINEERING NÂNG CẤP ====
+# ==== FEATURE ENGINEERING & LOGIC “BIẾT NGHĨ” ====
 def make_features(df):
     df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False)].copy()
     df['total'] = df['input'].apply(lambda x: sum([int(i) for i in x.split()]))
@@ -120,7 +119,6 @@ def make_features(df):
     df['chan'] = (df['even'] == 0).astype(int)
     df['le'] = (df['even'] == 1).astype(int)
 
-    # Rolling
     roll_n = ROLLING_WINDOW
     df['tai_roll'] = df['tai'].rolling(roll_n, min_periods=1).mean()
     df['xiu_roll'] = df['xiu'].rolling(roll_n, min_periods=1).mean()
@@ -147,7 +145,6 @@ def make_features(df):
     return df
 
 def train_models(df):
-    # Chỉ train rolling window mới nhất để tránh lây nhiễm lịch sử cũ
     df = df.tail(ROLLING_WINDOW*10)
     features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
                 'tai_lag_1', 'tai_lag_2', 'tai_lag_3', 'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
@@ -214,9 +211,8 @@ def predict_stacking(X_pred, models, key):
     probs = np.array([prob_lr, prob_rf, prob_xgb])
     return probs.mean(), probs
 
-# === Detect trend reversal ===
+# ==== MODULE ĐẢO CẦU & NGHI NGỜ ====
 def detect_trend_reversal(df, streak_min=5, n=ROLLING_WINDOW):
-    # Phát hiện chuỗi Tài/Xỉu hoặc Chẵn/Lẻ kéo dài bất thường
     recent = df.tail(n)
     if len(recent) == 0: return False, None
     streak_tai = recent['tai_streak'].iloc[-1]
@@ -224,6 +220,14 @@ def detect_trend_reversal(df, streak_min=5, n=ROLLING_WINDOW):
     if streak_tai >= streak_min:
         return True, "Tài" if last_tai == 1 else "Xỉu"
     return False, None
+
+def predict_next_trend(df, streak_min=5):
+    if len(df) == 0: return None, None
+    streak_tai = df['tai_streak'].iloc[-1]
+    last_tai = df['tai'].iloc[-1]
+    if streak_tai >= streak_min:
+        return "ĐẢO CẦU", f"Chuỗi {'Tài' if last_tai==1 else 'Xỉu'} đã kéo dài {streak_tai} phiên, khả năng phiên tới đảo chiều là rất cao."
+    return None, None
 
 PENDING_RESET = {}
 
@@ -257,7 +261,7 @@ def load_last_play():
     except Exception:
         return None
 
-# ==== BOT HANDLER bọc try-except ====
+# ==== HANDLER SAFE WRAPPER ====
 def safe_handler(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -275,7 +279,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     create_table()
-    # Xác nhận lệnh reset
     if user_id in PENDING_RESET and PENDING_RESET[user_id]:
         if text.upper() == "XÓA HẾT":
             delete_all_history()
@@ -323,7 +326,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         numbers = [int(x) for x in list(m.group(1))]
     else:
         numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
-    # Kiểm tra hợp lệ (giá trị xúc xắc 1–6)
     if any(n < 1 or n > 6 for n in numbers):
         await update.message.reply_text("Kết quả không hợp lệ. Mỗi số phải từ 1–6!")
         return
@@ -336,7 +338,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) > 0 and df.iloc[-1]['bot_predict']:
         last_predict = df.iloc[-1]['bot_predict']
 
-    # Sửa lỗi đúng/sai
     if len(df) > 0 and df.iloc[-1]['input'] == "BOT_PREDICT" and (df.iloc[-1]['actual'] is None or pd.isnull(df.iloc[-1]['actual'])):
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -358,7 +359,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Bạn cần nhập tối đa {MIN_SESSION_INPUT} phiên mới (sau khi bắt đầu session) để bot bắt đầu dự đoán trend session hiện tại!")
         return
 
-    # Train model rolling window mới nhất
     df_feat = make_features(df)
     n_trained = 0
     if os.path.exists(MODEL_META):
@@ -378,7 +378,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('\n'.join(lines))
         return
 
-    # Dự đoán rolling trend
     df_feat_session = make_features(df_session)
     features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
                 'tai_lag_1', 'tai_lag_2', 'tai_lag_3', 'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
@@ -396,22 +395,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         bao_proba = None
 
-    # Lưu dự đoán để so sánh đúng/sai
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
 
-    # Bắt trend: cảnh báo nếu chuỗi kéo dài (reversal)
+    # ======= MODULE “BIẾT NGHI NGỜ”, DỰ ĐOÁN ĐẢO CẦU =========
     trend_detected, trend_type = detect_trend_reversal(df_feat_session)
-    if trend_detected:
-        lines.append(f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! Đề xuất cân nhắc đảo chiều hoặc nghỉ.")
+    next_trend, explanation = predict_next_trend(df_feat_session)
 
-    # Nếu model dự đoán mạnh
-    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-        lines.append(f"🎯 Dự đoán: {tx} | {cl}")
-    else:
+    if trend_detected:
+        lines.append(
+            f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! {explanation if explanation else 'Rất dễ đảo chiều.'}"
+        )
+
+    # ML vẫn dự đoán trend cũ? BOT nghi ngờ mạnh!
+    if trend_detected and (tx == trend_type):
+        lines.append(
+            f"🤖 ML vẫn dự đoán {trend_type} theo chuỗi hiện tại. Tuy nhiên, theo kinh nghiệm thực tế, **khả năng đảo cầu phiên sau là rất cao!**"
+            "\n👉 Bạn nên cân nhắc vào ngược hoặc nghỉ để bảo toàn vốn."
+        )
+    elif next_trend:
+        lines.append(
+            f"🔔 BOT nghi ngờ có đảo cầu phiên tiếp theo ({next_trend})! {explanation}"
+        )
+
+    if abs(tx_proba - 0.5) < 0.1:
         lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
+    else:
+        if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+            lines.append(f"🎯 Dự đoán: {tx} | {cl}")
+        else:
+            lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
 
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
 
@@ -487,15 +502,33 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
-    # Bắt trend: cảnh báo nếu chuỗi kéo dài (reversal)
+    # Dự đoán đảo cầu khi cần
     trend_detected, trend_type = detect_trend_reversal(df_feat_session)
+    next_trend, explanation = predict_next_trend(df_feat_session)
+
     if trend_detected:
-        lines.append(f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! Đề xuất cân nhắc đảo chiều hoặc nghỉ.")
-    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-        lines.append(f"🎯 Dự đoán: {tx} | {cl}")
-    else:
+        lines.append(
+            f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! {explanation if explanation else 'Rất dễ đảo chiều.'}"
+        )
+    if trend_detected and (tx == trend_type):
+        lines.append(
+            f"🤖 ML vẫn dự đoán {trend_type} theo chuỗi hiện tại. Tuy nhiên, theo kinh nghiệm thực tế, **khả năng đảo cầu phiên sau là rất cao!**"
+            "\n👉 Bạn nên cân nhắc vào ngược hoặc nghỉ để bảo toàn vốn."
+        )
+    elif next_trend:
+        lines.append(
+            f"🔔 BOT nghi ngờ có đảo cầu phiên tiếp theo ({next_trend})! {explanation}"
+        )
+
+    if abs(tx_proba - 0.5) < 0.1:
         lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
+    else:
+        if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
+            lines.append(f"🎯 Dự đoán: {tx} | {cl}")
+        else:
+            lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
+
     if bao_pct != "-":
         lines.append(f"Xác suất ra bão: {bao_pct}%")
         if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None:
