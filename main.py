@@ -16,25 +16,28 @@ import numpy as np
 from flask import Flask
 import threading
 import warnings
+import traceback
 
 # ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Các tham số tùy chỉnh
+ROLLING_WINDOW = 12        # Rolling window nhỏ để bắt trend nhanh
 MIN_BATCH = 5
-ROLLING_WINDOW = 50
 PROBA_CUTOFF = 0.62
 PROBA_ALERT = 0.75
 BAO_CUTOFF = 0.03
-TRAIN_EVERY = 5  # Chỉ train lại model khi có >=5 phiên mới
-
+TRAIN_EVERY = 5
 MODEL_PATH = "ml_stack.joblib"
 MODEL_META = "ml_meta.txt"
 SESSION_FILE = "session_time.txt"
 LAST_PLAY_FILE = "last_play_time.txt"
-MIN_SESSION_INPUT = 10      # Số phiên tối đa cần nhập để bắt trend mới
-SESSION_BREAK_MINUTES = 30  # Bao nhiêu phút nghỉ thì bot coi là session mới
+MIN_SESSION_INPUT = 10
+SESSION_BREAK_MINUTES = 30
 
 if not BOT_TOKEN or not DATABASE_URL:
+    print("Lỗi: Chưa set BOT_TOKEN hoặc DATABASE_URL.")
     raise Exception("Bạn cần set BOT_TOKEN và DATABASE_URL ở biến môi trường!")
 
 # ==== FLASK giữ cổng để tránh sleep ====
@@ -57,7 +60,6 @@ threading.Thread(target=start_flask, daemon=True).start()
 def create_table():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
-    # Tạo bảng nếu chưa có
     cur.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id SERIAL PRIMARY KEY,
@@ -90,14 +92,12 @@ def insert_result(input_str, actual, bot_predict=None):
     conn.close()
 
 def fetch_history(limit=10000):
-    # Sử dụng SQLAlchemy để tránh warning pandas!
     engine = create_engine(DATABASE_URL)
     df = pd.read_sql(
         "SELECT id, input, actual, bot_predict, created_at FROM history ORDER BY id ASC LIMIT %s" % limit,
         engine
     )
     engine.dispose()
-    # Chỉ lấy các dòng input là 3 số
     df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False) | (df['input'] == "BOT_PREDICT")]
     return df
 
@@ -109,6 +109,7 @@ def delete_all_history():
     cur.close()
     conn.close()
 
+# ==== FEATURE ENGINEERING NÂNG CẤP ====
 def make_features(df):
     df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False)].copy()
     df['total'] = df['input'].apply(lambda x: sum([int(i) for i in x.split()]))
@@ -118,15 +119,40 @@ def make_features(df):
     df['xiu'] = (df['total'] <= 10).astype(int)
     df['chan'] = (df['even'] == 0).astype(int)
     df['le'] = (df['even'] == 1).astype(int)
-    df['tai_roll'] = df['tai'].rolling(ROLLING_WINDOW, min_periods=1).mean()
-    df['xiu_roll'] = df['xiu'].rolling(ROLLING_WINDOW, min_periods=1).mean()
-    df['chan_roll'] = df['chan'].rolling(ROLLING_WINDOW, min_periods=1).mean()
-    df['le_roll'] = df['le'].rolling(ROLLING_WINDOW, min_periods=1).mean()
-    df['bao_roll'] = df['bao'].rolling(ROLLING_WINDOW, min_periods=1).mean()
+
+    # Rolling
+    roll_n = ROLLING_WINDOW
+    df['tai_roll'] = df['tai'].rolling(roll_n, min_periods=1).mean()
+    df['xiu_roll'] = df['xiu'].rolling(roll_n, min_periods=1).mean()
+    df['chan_roll'] = df['chan'].rolling(roll_n, min_periods=1).mean()
+    df['le_roll'] = df['le'].rolling(roll_n, min_periods=1).mean()
+    df['bao_roll'] = df['bao'].rolling(roll_n, min_periods=1).mean()
+
+    # Lag features
+    for i in range(1, 4):
+        df[f'tai_lag_{i}'] = df['tai'].shift(i)
+        df[f'chan_lag_{i}'] = df['chan'].shift(i)
+
+    # Streak features
+    def get_streak(arr):
+        streaks = [1]
+        for i in range(1, len(arr)):
+            if arr[i] == arr[i-1]:
+                streaks.append(streaks[-1] + 1)
+            else:
+                streaks.append(1)
+        return streaks
+    df['tai_streak'] = get_streak(df['tai'].tolist())
+    df['chan_streak'] = get_streak(df['chan'].tolist())
     return df
 
 def train_models(df):
-    X = df[['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+    # Chỉ train rolling window mới nhất để tránh lây nhiễm lịch sử cũ
+    df = df.tail(ROLLING_WINDOW*10)
+    features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
+                'tai_lag_1', 'tai_lag_2', 'tai_lag_3', 'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
+                'tai_streak', 'chan_streak']
+    X = df[features].fillna(0)
     y_tx = (df['total'] >= 11).astype(int)
     y_cl = (df['even'] == 0).astype(int)
     y_bao = df['bao']
@@ -142,7 +168,6 @@ def train_models(df):
             xgbc = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y)
         models[key] = (lr, rf, xgbc)
     joblib.dump(models, MODEL_PATH)
-    # Lưu số lượng phiên thực tế đã train vào file meta
     with open(MODEL_META, "w") as f:
         f.write(str(len(df)))
 
@@ -189,6 +214,17 @@ def predict_stacking(X_pred, models, key):
     probs = np.array([prob_lr, prob_rf, prob_xgb])
     return probs.mean(), probs
 
+# === Detect trend reversal ===
+def detect_trend_reversal(df, streak_min=5, n=ROLLING_WINDOW):
+    # Phát hiện chuỗi Tài/Xỉu hoặc Chẵn/Lẻ kéo dài bất thường
+    recent = df.tail(n)
+    if len(recent) == 0: return False, None
+    streak_tai = recent['tai_streak'].iloc[-1]
+    last_tai = recent['tai'].iloc[-1]
+    if streak_tai >= streak_min:
+        return True, "Tài" if last_tai == 1 else "Xỉu"
+    return False, None
+
 PENDING_RESET = {}
 
 def save_session_start(time=None):
@@ -221,6 +257,20 @@ def load_last_play():
     except Exception:
         return None
 
+# ==== BOT HANDLER bọc try-except ====
+def safe_handler(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await func(update, context)
+        except Exception as e:
+            err = f"LỖI: {e}\n{traceback.format_exc()}"
+            try:
+                await update.message.reply_text("🤖 BOT gặp lỗi kỹ thuật:\n" + str(e))
+            except:
+                pass
+            print(err)
+    return wrapper
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -242,7 +292,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     need_new_session = False
     minutes_since_last = None
 
-    # Check nếu có last_play
     if last_play:
         delta = (now - last_play).total_seconds() / 60
         minutes_since_last = int(delta)
@@ -251,7 +300,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         need_new_session = True
 
-    # Nếu cần bắt đầu session mới tự động
     if need_new_session:
         save_session_start(now)
         if minutes_since_last:
@@ -264,7 +312,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏰ Bắt đầu session mới! Hãy nhập tối đa {MIN_SESSION_INPUT} phiên mới để bot bắt lại trend."
             )
 
-    # Update lại thời gian chơi mới nhất
     save_last_play(now)
 
     m = re.match(r"^(\d{3})$", text)
@@ -272,21 +319,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (m or m2):
         await update.message.reply_text("Vui lòng nhập kết quả theo định dạng: 456 hoặc 4 5 6.")
         return
-    numbers = [int(x) for x in (m.group(1) if m else " ".join([m2.group(1), m2.group(2), m2.group(3)]))]
+    if m:
+        numbers = [int(x) for x in list(m.group(1))]
+    else:
+        numbers = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
+    # Kiểm tra hợp lệ (giá trị xúc xắc 1–6)
+    if any(n < 1 or n > 6 for n in numbers):
+        await update.message.reply_text("Kết quả không hợp lệ. Mỗi số phải từ 1–6!")
+        return
     input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     total = sum(numbers)
     actual = "Tài" if total >= 11 else "Xỉu"
 
-    # Lấy dự đoán gần nhất (nếu có)
     df = fetch_history(10000)
     last_predict = None
     if len(df) > 0 and df.iloc[-1]['bot_predict']:
         last_predict = df.iloc[-1]['bot_predict']
 
-    # ======= ĐÂY LÀ PHẦN SỬA LỖI ĐÚNG/SAI =========
-    # Nếu dòng cuối là BOT_PREDICT và chưa có actual, cập nhật luôn actual vào dòng này
+    # Sửa lỗi đúng/sai
     if len(df) > 0 and df.iloc[-1]['input'] == "BOT_PREDICT" and (df.iloc[-1]['actual'] is None or pd.isnull(df.iloc[-1]['actual'])):
-        # Tìm id dòng này để update
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         last_id = int(df.iloc[-1]['id'])
@@ -296,9 +347,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
     else:
         insert_result(input_str, actual, last_predict)
-    # ======= HẾT PHẦN SỬA LỖI =========
 
-    # Đọc lại lịch sử thực tế
     df = fetch_history(10000)
     session_start = load_session_start()
     if session_start:
@@ -309,7 +358,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Bạn cần nhập tối đa {MIN_SESSION_INPUT} phiên mới (sau khi bắt đầu session) để bot bắt đầu dự đoán trend session hiện tại!")
         return
 
-    # Train model bằng toàn bộ lịch sử
+    # Train model rolling window mới nhất
     df_feat = make_features(df)
     n_trained = 0
     if os.path.exists(MODEL_META):
@@ -321,24 +370,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) >= MIN_BATCH and (len(df) - n_trained >= TRAIN_EVERY):
         train_models(df_feat)
     models = load_models()
-    if (models is None or 
-        models['tx'] is None or
-        models['cl'] is None):
-        lines = []
-        lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
-        lines.append("⚠️ Chưa đủ dữ liệu đa dạng để dự đoán (lịch sử cần đủ cả Tài/Xỉu và Chẵn/Lẻ). Nhập thêm các tổng thấp và cao, tổng chẵn/lẻ để bot hoạt động chính xác!")
+    if (models is None or models['tx'] is None or models['cl'] is None):
+        lines = [
+            f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}",
+            "⚠️ Chưa đủ dữ liệu đa dạng để dự đoán (cần đủ cả Tài/Xỉu & Chẵn/Lẻ). Nhập thêm tổng thấp/cao, chẵn/lẻ để bot hoạt động chính xác!"
+        ]
         await update.message.reply_text('\n'.join(lines))
         return
 
-    # Dự đoán rolling trend chỉ dựa trên session hiện tại
+    # Dự đoán rolling trend
     df_feat_session = make_features(df_session)
-    X_pred = df_feat_session.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+    features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
+                'tai_lag_1', 'tai_lag_2', 'tai_lag_3', 'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
+                'tai_streak', 'chan_streak']
+    X_pred = df_feat_session.iloc[[-1]][features].fillna(0)
     tx_proba, tx_probs = predict_stacking(X_pred, models, 'tx')
     tx = "Tài" if tx_proba >= 0.5 else "Xỉu"
     cl_proba, cl_probs = predict_stacking(X_pred, models, 'cl')
     cl = "Chẵn" if cl_proba >= 0.5 else "Lẻ"
     dai_diem = suggest_best_totals(df_session, tx)
-    # BÃO chỉ dự đoán nếu đã có model
     bao_pct = "-"
     if models.get('bao') is not None:
         bao_proba, bao_probs = predict_stacking(X_pred, models, 'bao')
@@ -346,17 +396,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         bao_proba = None
 
-    # Lưu lại dự đoán vào DB để so sánh đúng/sai
+    # Lưu dự đoán để so sánh đúng/sai
     insert_result("BOT_PREDICT", None, tx)
-
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
+
+    # Bắt trend: cảnh báo nếu chuỗi kéo dài (reversal)
+    trend_detected, trend_type = detect_trend_reversal(df_feat_session)
+    if trend_detected:
+        lines.append(f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! Đề xuất cân nhắc đảo chiều hoặc nghỉ.")
+
+    # Nếu model dự đoán mạnh
     if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
         lines.append(f"🎯 Dự đoán: {tx} | {cl}")
     else:
-        lines.append("⚠️ Dự đoán: Nên nghỉ phiên này!")
+        lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
+
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
+
     if bao_pct != "-":
         lines.append(f"Xác suất ra bão: {bao_pct}%")
         if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None:
@@ -374,14 +432,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 Chào mừng đến với Sicbo ML Bot!\n\n"
+        "🤖 Chào mừng đến với Sicbo ML Bot Nâng Cấp!\n\n"
         "Các lệnh hỗ trợ:\n"
         "/start – Xem hướng dẫn và danh sách lệnh\n"
         "/predict – Dự đoán phiên tiếp theo\n"
         "/stats – Thống kê hiệu suất dự đoán\n"
         "/reset – Xóa toàn bộ lịch sử data (cần xác nhận)\n"
-        "Không cần nhập lệnh session nữa! Bot sẽ tự động nhận biết nếu bạn nghỉ lâu và nhắc bắt trend mới.\n\n"
         "Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model.\n"
+        "BOT sẽ cảnh báo khi xuất hiện trend mạnh hoặc trend đảo chiều!\n"
         f"Nếu nghỉ quá {SESSION_BREAK_MINUTES} phút, bot sẽ tự động yêu cầu nhập tối đa {MIN_SESSION_INPUT} phiên đầu để bắt lại trend session!"
     )
     await update.message.reply_text(msg)
@@ -407,13 +465,14 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(df) - n_trained >= TRAIN_EVERY:
         train_models(df_feat)
     models = load_models()
-    if (models is None or 
-        models['tx'] is None or
-        models['cl'] is None):
+    if (models is None or models['tx'] is None or models['cl'] is None):
         await update.message.reply_text("⚠️ Chưa đủ dữ liệu đa dạng để dự đoán (lịch sử cần đủ cả Tài/Xỉu và Chẵn/Lẻ). Nhập thêm các tổng thấp và cao, tổng chẵn/lẻ để bot hoạt động chính xác!")
         return
     df_feat_session = make_features(df_session)
-    X_pred = df_feat_session.iloc[[-1]][['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll']]
+    features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
+                'tai_lag_1', 'tai_lag_2', 'tai_lag_3', 'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
+                'tai_streak', 'chan_streak']
+    X_pred = df_feat_session.iloc[[-1]][features].fillna(0)
     tx_proba, _ = predict_stacking(X_pred, models, 'tx')
     cl_proba, _ = predict_stacking(X_pred, models, 'cl')
     tx = "Tài" if tx_proba >= 0.5 else "Xỉu"
@@ -428,10 +487,14 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
+    # Bắt trend: cảnh báo nếu chuỗi kéo dài (reversal)
+    trend_detected, trend_type = detect_trend_reversal(df_feat_session)
+    if trend_detected:
+        lines.append(f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! Đề xuất cân nhắc đảo chiều hoặc nghỉ.")
     if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
         lines.append(f"🎯 Dự đoán: {tx} | {cl}")
     else:
-        lines.append("⚠️ Dự đoán: Nên nghỉ phiên này!")
+        lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
     if bao_pct != "-":
         lines.append(f"Xác suất ra bão: {bao_pct}%")
@@ -471,11 +534,11 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     create_table()
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("predict", predict))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("start", safe_handler(start)))
+    app.add_handler(CommandHandler("predict", safe_handler(predict)))
+    app.add_handler(CommandHandler("stats", safe_handler(stats)))
+    app.add_handler(CommandHandler("reset", safe_handler(reset)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(handle_message)))
     app.run_polling()
 
 if __name__ == "__main__":
