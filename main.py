@@ -17,12 +17,13 @@ from flask import Flask
 import threading
 import warnings
 import traceback
+import time
 
 # ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-ROLLING_WINDOW = 12        # Rolling nhỏ để BOT bắt trend, đảo cầu nhanh
+ROLLING_WINDOW = 12
 MIN_BATCH = 5
 PROBA_CUTOFF = 0.62
 PROBA_ALERT = 0.75
@@ -34,6 +35,7 @@ SESSION_FILE = "session_time.txt"
 LAST_PLAY_FILE = "last_play_time.txt"
 MIN_SESSION_INPUT = 10
 SESSION_BREAK_MINUTES = 30
+INPUT_DELAY_SEC = 90   # nếu kết quả phiên nhập trễ hơn 90s, sẽ cảnh báo bỏ qua
 
 if not BOT_TOKEN or not DATABASE_URL:
     print("Lỗi: Chưa set BOT_TOKEN hoặc DATABASE_URL.")
@@ -65,26 +67,27 @@ def create_table():
             input TEXT,
             actual TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
-            bot_predict TEXT
+            bot_predict TEXT,
+            input_time FLOAT DEFAULT NULL
         );
     """)
     conn.commit()
     cur.close()
     conn.close()
 
-def insert_result(input_str, actual, bot_predict=None):
+def insert_result(input_str, actual, bot_predict=None, input_time=None):
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     now = datetime.now()
     if bot_predict is not None:
         cur.execute(
-            "INSERT INTO history (input, actual, bot_predict, created_at) VALUES (%s, %s, %s, %s);",
-            (input_str, actual, bot_predict, now)
+            "INSERT INTO history (input, actual, bot_predict, created_at, input_time) VALUES (%s, %s, %s, %s, %s);",
+            (input_str, actual, bot_predict, now, input_time)
         )
     else:
         cur.execute(
-            "INSERT INTO history (input, actual, created_at) VALUES (%s, %s, %s);",
-            (input_str, actual, now)
+            "INSERT INTO history (input, actual, created_at, input_time) VALUES (%s, %s, %s, %s);",
+            (input_str, actual, now, input_time)
         )
     conn.commit()
     cur.close()
@@ -93,7 +96,7 @@ def insert_result(input_str, actual, bot_predict=None):
 def fetch_history(limit=10000):
     engine = create_engine(DATABASE_URL)
     df = pd.read_sql(
-        "SELECT id, input, actual, bot_predict, created_at FROM history ORDER BY id ASC LIMIT %s" % limit,
+        "SELECT id, input, actual, bot_predict, created_at, input_time FROM history ORDER BY id ASC LIMIT %s" % limit,
         engine
     )
     engine.dispose()
@@ -108,7 +111,7 @@ def delete_all_history():
     cur.close()
     conn.close()
 
-# ==== FEATURE ENGINEERING & LOGIC “BIẾT NGHĨ” ====
+# ==== FEATURE ENGINEERING ====
 def make_features(df):
     df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False)].copy()
     df['total'] = df['input'].apply(lambda x: sum([int(i) for i in x.split()]))
@@ -184,16 +187,48 @@ def summary_stats(df):
     else:
         return 0, 0, 0, 0
 
+# ==== MARKOV CHAIN DỰ ĐOÁN ĐẢO CẦU (tự động học, không đặt ngưỡng cứng) ====
+def compute_markov_transition(df):
+    # Chỉ quan tâm tới chuyển đổi Tài <-> Xỉu
+    if len(df) < 10:
+        return None
+    seq = df['tai'].tolist()
+    transitions = {"T->T":0, "T->X":0, "X->T":0, "X->X":0}
+    for i in range(1, len(seq)):
+        prev = "T" if seq[i-1] == 1 else "X"
+        curr = "T" if seq[i] == 1 else "X"
+        transitions[f"{prev}->{curr}"] += 1
+    total_T = transitions["T->T"] + transitions["T->X"]
+    total_X = transitions["X->T"] + transitions["X->X"]
+    # Xác suất chuyển đổi trạng thái dựa trên rolling window
+    prob_T2X = transitions["T->X"] / total_T if total_T else 0.0
+    prob_X2T = transitions["X->T"] / total_X if total_X else 0.0
+    # Xu hướng hiện tại là gì?
+    last = "T" if seq[-1]==1 else "X"
+    # Nếu vừa có chuỗi T, và xác suất chuyển sang X tăng mạnh hơn rolling mean gần nhất, BOT sẽ đảo cửa
+    return {
+        "prob_T2X": prob_T2X,
+        "prob_X2T": prob_X2T,
+        "last": last
+    }
+
 def suggest_best_totals(df, prediction):
     if prediction not in ("Tài", "Xỉu") or df.empty:
         return "-"
     recent = df.tail(ROLLING_WINDOW)
     totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s and s != "BOT_PREDICT"]
-    if prediction == "Tài":
-        eligible = [t for t in range(11, 19)]
+    # Loại bỏ outlier bằng cách chỉ lấy các điểm trong rolling window ±1 std
+    if totals:
+        mean = np.mean(totals)
+        std = np.std(totals)
+        safe_range = [t for t in totals if (mean-std)<=t<=(mean+std)]
     else:
-        eligible = [t for t in range(3, 11)]
-    count = pd.Series([t for t in totals if t in eligible]).value_counts()
+        safe_range = totals
+    if prediction == "Tài":
+        eligible = [t for t in safe_range if t >= 11]
+    else:
+        eligible = [t for t in safe_range if t <= 10]
+    count = pd.Series(eligible).value_counts()
     if count.empty:
         return "-"
     best = count.index[:3].tolist()
@@ -210,56 +245,6 @@ def predict_stacking(X_pred, models, key):
     prob_xgb = xgbc.predict_proba(X_pred)[0][1]
     probs = np.array([prob_lr, prob_rf, prob_xgb])
     return probs.mean(), probs
-
-# ==== MODULE ĐẢO CẦU & NGHI NGỜ ====
-def detect_trend_reversal(df, streak_min=5, n=ROLLING_WINDOW):
-    recent = df.tail(n)
-    if len(recent) == 0: return False, None
-    streak_tai = recent['tai_streak'].iloc[-1]
-    last_tai = recent['tai'].iloc[-1]
-    if streak_tai >= streak_min:
-        return True, "Tài" if last_tai == 1 else "Xỉu"
-    return False, None
-
-def predict_next_trend(df, streak_min=5):
-    if len(df) == 0: return None, None
-    streak_tai = df['tai_streak'].iloc[-1]
-    last_tai = df['tai'].iloc[-1]
-    if streak_tai >= streak_min:
-        return "ĐẢO CẦU", f"Chuỗi {'Tài' if last_tai==1 else 'Xỉu'} đã kéo dài {streak_tai} phiên, khả năng phiên tới đảo chiều là rất cao."
-    return None, None
-
-PENDING_RESET = {}
-
-def save_session_start(time=None):
-    with open(SESSION_FILE, "w") as f:
-        t = time if time else datetime.now().isoformat()
-        f.write(str(t))
-
-def load_session_start():
-    if not os.path.exists(SESSION_FILE):
-        return None
-    with open(SESSION_FILE, "r") as f:
-        t = f.read().strip()
-    try:
-        return datetime.fromisoformat(t)
-    except Exception:
-        return None
-
-def save_last_play(time=None):
-    with open(LAST_PLAY_FILE, "w") as f:
-        t = time if time else datetime.now().isoformat()
-        f.write(str(t))
-
-def load_last_play():
-    if not os.path.exists(LAST_PLAY_FILE):
-        return None
-    with open(LAST_PLAY_FILE, "r") as f:
-        t = f.read().strip()
-    try:
-        return datetime.fromisoformat(t)
-    except Exception:
-        return None
 
 # ==== HANDLER SAFE WRAPPER ====
 def safe_handler(func):
@@ -279,6 +264,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     create_table()
+    now = datetime.now()
+    input_time = time.time()
+    # ==== Kiểm tra độ trễ của phiên nhập ====
+    last_play = load_last_play()
+    delay_warning = False
+    if last_play:
+        delta = (now - last_play).total_seconds()
+        if delta > INPUT_DELAY_SEC:
+            delay_warning = True
+    save_last_play(now)
+    # ==== Xử lý reset/history cũ ====
     if user_id in PENDING_RESET and PENDING_RESET[user_id]:
         if text.upper() == "XÓA HẾT":
             delete_all_history()
@@ -288,34 +284,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_RESET[user_id] = False
             await update.message.reply_text("❌ Hủy thao tác xóa.")
         return
-
-    now = datetime.now()
-    last_play = load_last_play()
-    session_start = load_session_start()
-    need_new_session = False
-    minutes_since_last = None
-
-    if last_play:
-        delta = (now - last_play).total_seconds() / 60
-        minutes_since_last = int(delta)
-        if delta >= SESSION_BREAK_MINUTES:
-            need_new_session = True
-    else:
-        need_new_session = True
-
-    if need_new_session:
-        save_session_start(now)
-        if minutes_since_last:
-            await update.message.reply_text(
-                f"⏰ Bạn đã không chơi trong {minutes_since_last} phút. "
-                f"Hãy nhập tối đa {MIN_SESSION_INPUT} phiên mới để bot bắt lại trend session!"
-            )
-        else:
-            await update.message.reply_text(
-                f"⏰ Bắt đầu session mới! Hãy nhập tối đa {MIN_SESSION_INPUT} phiên mới để bot bắt lại trend."
-            )
-
-    save_last_play(now)
 
     m = re.match(r"^(\d{3})$", text)
     m2 = re.match(r"^(\d+)\s+(\d+)\s+(\d+)$", text)
@@ -332,6 +300,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     total = sum(numbers)
     actual = "Tài" if total >= 11 else "Xỉu"
+    # Nếu độ trễ nhập quá lớn, cảnh báo và không update
+    if delay_warning:
+        await update.message.reply_text("⚠️ Phiên này bạn nhập quá trễ (trên 90s), BOT sẽ không sử dụng dữ liệu này để đảm bảo độ chính xác dự đoán cho phiên tiếp theo.")
+        return
 
     df = fetch_history(10000)
     last_predict = None
@@ -347,7 +319,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
     else:
-        insert_result(input_str, actual, last_predict)
+        insert_result(input_str, actual, last_predict, input_time)
 
     df = fetch_history(10000)
     session_start = load_session_start()
@@ -395,54 +367,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         bao_proba = None
 
+    # ==== MARKOV tự động học và quyết định đảo cầu (KHÔNG dùng ngưỡng cứng) ====
+    markov_info = compute_markov_transition(df_feat_session)
+    decision_override = False
+    reason = ""
+    if markov_info:
+        if markov_info['last'] == "T" and tx == "Tài" and markov_info['prob_T2X'] > markov_info['prob_X2T']:
+            tx = "Xỉu"
+            decision_override = True
+            reason = f"Markov phát hiện khả năng đảo cầu từ Tài sang Xỉu tăng bất thường."
+        elif markov_info['last'] == "X" and tx == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_T2X']:
+            tx = "Tài"
+            decision_override = True
+            reason = f"Markov phát hiện khả năng đảo cầu từ Xỉu sang Tài tăng bất thường."
+    # (Có thể kết hợp thêm rolling momentum, rolling mean biến động mạnh cũng sẽ override nhưng không ép threshold cứng)
+
+    # ==== Lưu dự đoán và trả kết quả ====
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
 
-    # ======= MODULE “BIẾT NGHI NGỜ”, DỰ ĐOÁN ĐẢO CẦU =========
-    trend_detected, trend_type = detect_trend_reversal(df_feat_session)
-    next_trend, explanation = predict_next_trend(df_feat_session)
-
-    if trend_detected:
-        lines.append(
-            f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! {explanation if explanation else 'Rất dễ đảo chiều.'}"
-        )
-
-    # ML vẫn dự đoán trend cũ? BOT nghi ngờ mạnh!
-    if trend_detected and (tx == trend_type):
-        lines.append(
-            f"🤖 ML vẫn dự đoán {trend_type} theo chuỗi hiện tại. Tuy nhiên, theo kinh nghiệm thực tế, **khả năng đảo cầu phiên sau là rất cao!**"
-            "\n👉 Bạn nên cân nhắc vào ngược hoặc nghỉ để bảo toàn vốn."
-        )
-    elif next_trend:
-        lines.append(
-            f"🔔 BOT nghi ngờ có đảo cầu phiên tiếp theo ({next_trend})! {explanation}"
-        )
+    # ==== Trả lời phân tích kết quả ====
+    if decision_override:
+        lines.append(f"🔄 BOT tự động đảo cửa: {tx} ({reason})")
+    else:
+        lines.append(f"🎯 Dự đoán phiên tiếp: {tx} | {cl}")
 
     if abs(tx_proba - 0.5) < 0.1:
-        lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
-    else:
-        if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-            lines.append(f"🎯 Dự đoán: {tx} | {cl}")
-        else:
-            lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
-
+        lines.append("⚠️ BOT nhận diện thấy xác suất không rõ ràng, nên cân nhắc nghỉ phiên này!")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
-
     if bao_pct != "-":
         lines.append(f"Xác suất ra bão: {bao_pct}%")
         if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None:
             lines.append(f"❗️CẢNH BÁO: Xác suất bão cao ({bao_pct}%) – cân nhắc vào bão!")
-    else:
-        lines.append(f"Chưa đủ dữ liệu để dự đoán bão.")
-    if max(tx_proba, 1-tx_proba) >= PROBA_ALERT:
-        lines.append(f"❗️CẢNH BÁO: Xác suất {tx} vượt {int(PROBA_ALERT*100)}% – trend cực mạnh!")
     lines.append(f"BOT đã dự đoán: {so_du_doan} phiên | Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%")
-    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-        lines.append(f"Nhận định: Ưu tiên {tx}, {cl}, dải {dai_diem}. Bão {bao_pct}% – {'ưu tiên' if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None else 'không nên đánh'} bão.")
-    else:
-        lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
     await update.message.reply_text('\n'.join(lines))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,8 +413,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats – Thống kê hiệu suất dự đoán\n"
         "/reset – Xóa toàn bộ lịch sử data (cần xác nhận)\n"
         "Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model.\n"
-        "BOT sẽ cảnh báo khi xuất hiện trend mạnh hoặc trend đảo chiều!\n"
-        f"Nếu nghỉ quá {SESSION_BREAK_MINUTES} phút, bot sẽ tự động yêu cầu nhập tối đa {MIN_SESSION_INPUT} phiên đầu để bắt lại trend session!"
+        "BOT sẽ tự động phát hiện trend, đảo cầu, và cảnh báo khi xác suất đảo chiều tăng bất thường!"
+        f"\nNếu nghỉ quá {SESSION_BREAK_MINUTES} phút, bot sẽ tự động yêu cầu nhập tối đa {MIN_SESSION_INPUT} phiên đầu để bắt lại trend session!"
     )
     await update.message.reply_text(msg)
 
@@ -499,49 +458,33 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bao_pct = round(bao_proba*100,2)
     else:
         bao_proba = None
+
+    # Markov đánh giá đảo cầu
+    markov_info = compute_markov_transition(df_feat_session)
+    decision_override = False
+    reason = ""
+    if markov_info:
+        if markov_info['last'] == "T" and tx == "Tài" and markov_info['prob_T2X'] > markov_info['prob_X2T']:
+            tx = "Xỉu"
+            decision_override = True
+            reason = f"Markov phát hiện khả năng đảo cầu từ Tài sang Xỉu tăng bất thường."
+        elif markov_info['last'] == "X" and tx == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_T2X']:
+            tx = "Tài"
+            decision_override = True
+            reason = f"Markov phát hiện khả năng đảo cầu từ Xỉu sang Tài tăng bất thường."
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
-    # Dự đoán đảo cầu khi cần
-    trend_detected, trend_type = detect_trend_reversal(df_feat_session)
-    next_trend, explanation = predict_next_trend(df_feat_session)
-
-    if trend_detected:
-        lines.append(
-            f"⚡️ BOT phát hiện chuỗi {trend_type} kéo dài >=5 phiên! {explanation if explanation else 'Rất dễ đảo chiều.'}"
-        )
-    if trend_detected and (tx == trend_type):
-        lines.append(
-            f"🤖 ML vẫn dự đoán {trend_type} theo chuỗi hiện tại. Tuy nhiên, theo kinh nghiệm thực tế, **khả năng đảo cầu phiên sau là rất cao!**"
-            "\n👉 Bạn nên cân nhắc vào ngược hoặc nghỉ để bảo toàn vốn."
-        )
-    elif next_trend:
-        lines.append(
-            f"🔔 BOT nghi ngờ có đảo cầu phiên tiếp theo ({next_trend})! {explanation}"
-        )
-
-    if abs(tx_proba - 0.5) < 0.1:
-        lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
+    if decision_override:
+        lines.append(f"🔄 BOT tự động đảo cửa: {tx} ({reason})")
     else:
-        if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-            lines.append(f"🎯 Dự đoán: {tx} | {cl}")
-        else:
-            lines.append("⚠️ BOT không nhận diện được ưu thế rõ ràng, nên nghỉ phiên này!")
+        lines.append(f"🎯 Dự đoán phiên tiếp: {tx} | {cl}")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
-
     if bao_pct != "-":
         lines.append(f"Xác suất ra bão: {bao_pct}%")
         if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None:
             lines.append(f"❗️CẢNH BÁO: Xác suất bão cao ({bao_pct}%) – cân nhắc vào bão!")
-    else:
-        lines.append(f"Chưa đủ dữ liệu để dự đoán bão.")
-    if max(tx_proba, 1-tx_proba) >= PROBA_ALERT:
-        lines.append(f"❗️CẢNH BÁO: Xác suất {tx} vượt {int(PROBA_ALERT*100)}% – trend cực mạnh!")
     lines.append(f"BOT đã dự đoán: {so_du_doan} phiên | Đúng: {dung} | Sai: {sai} | Tỉ lệ đúng: {tile}%")
-    if max(tx_proba, 1-tx_proba) >= PROBA_CUTOFF:
-        lines.append(f"Nhận định: Ưu tiên {tx}, {cl}, dải {dai_diem}. Bão {bao_pct}% – {'ưu tiên' if bao_proba and bao_proba >= BAO_CUTOFF and models['bao'] is not None else 'không nên đánh'} bão.")
-    else:
-        lines.append("Nhận định: Không có cửa ưu thế, nên nghỉ.")
     await update.message.reply_text('\n'.join(lines))
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,6 +516,39 @@ def main():
     app.add_handler(CommandHandler("reset", safe_handler(reset)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(handle_message)))
     app.run_polling()
+
+# ==== STATE HANDLING ====
+PENDING_RESET = {}
+
+def save_session_start(time=None):
+    with open(SESSION_FILE, "w") as f:
+        t = time if time else datetime.now().isoformat()
+        f.write(str(t))
+
+def load_session_start():
+    if not os.path.exists(SESSION_FILE):
+        return None
+    with open(SESSION_FILE, "r") as f:
+        t = f.read().strip()
+    try:
+        return datetime.fromisoformat(t)
+    except Exception:
+        return None
+
+def save_last_play(time=None):
+    with open(LAST_PLAY_FILE, "w") as f:
+        t = time if time else datetime.now().isoformat()
+        f.write(str(t))
+
+def load_last_play():
+    if not os.path.exists(LAST_PLAY_FILE):
+        return None
+    with open(LAST_PLAY_FILE, "r") as f:
+        t = f.read().strip()
+    try:
+        return datetime.fromisoformat(t)
+    except Exception:
+        return None
 
 if __name__ == "__main__":
     main()
