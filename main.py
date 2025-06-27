@@ -62,6 +62,15 @@ threading.Thread(target=start_flask, daemon=True).start()
 def create_table():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
+
+    # ✅ Thêm cột input_time nếu chưa có
+    try:
+        cur.execute("ALTER TABLE history ADD COLUMN input_time FLOAT;")
+        conn.commit()
+    except psycopg2.errors.DuplicateColumn:
+        conn.rollback()
+
+    # ✅ Tạo bảng nếu chưa có (giữ nguyên đoạn sau)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS history (
             id SERIAL PRIMARY KEY,
@@ -75,6 +84,7 @@ def create_table():
     conn.commit()
     cur.close()
     conn.close()
+
 
 def insert_result(input_str, actual, bot_predict=None, input_time=None):
     conn = psycopg2.connect(DATABASE_URL)
