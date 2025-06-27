@@ -18,6 +18,7 @@ import threading
 import warnings
 import traceback
 import time
+import io
 
 # ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -97,6 +98,17 @@ def fetch_history(limit=10000):
     engine = create_engine(DATABASE_URL)
     df = pd.read_sql(
         "SELECT id, input, actual, bot_predict, created_at, input_time FROM history ORDER BY id ASC LIMIT %s" % limit,
+        engine
+    )
+    engine.dispose()
+    df = df[df['input'].str.match(r"^\d+\s+\d+\s+\d+$", na=False) | (df['input'] == "BOT_PREDICT")]
+    return df
+
+# ==== Xuất toàn bộ lịch sử (KHÔNG giới hạn dòng) ====
+def fetch_history_all():
+    engine = create_engine(DATABASE_URL)
+    df = pd.read_sql(
+        "SELECT id, input, actual, bot_predict, created_at, input_time FROM history ORDER BY id ASC",
         engine
     )
     engine.dispose()
@@ -189,7 +201,6 @@ def summary_stats(df):
 
 # ==== MARKOV CHAIN DỰ ĐOÁN ĐẢO CẦU (tự động học, không đặt ngưỡng cứng) ====
 def compute_markov_transition(df):
-    # Chỉ quan tâm tới chuyển đổi Tài <-> Xỉu
     if len(df) < 10:
         return None
     seq = df['tai'].tolist()
@@ -200,12 +211,9 @@ def compute_markov_transition(df):
         transitions[f"{prev}->{curr}"] += 1
     total_T = transitions["T->T"] + transitions["T->X"]
     total_X = transitions["X->T"] + transitions["X->X"]
-    # Xác suất chuyển đổi trạng thái dựa trên rolling window
     prob_T2X = transitions["T->X"] / total_T if total_T else 0.0
     prob_X2T = transitions["X->T"] / total_X if total_X else 0.0
-    # Xu hướng hiện tại là gì?
     last = "T" if seq[-1]==1 else "X"
-    # Nếu vừa có chuỗi T, và xác suất chuyển sang X tăng mạnh hơn rolling mean gần nhất, BOT sẽ đảo cửa
     return {
         "prob_T2X": prob_T2X,
         "prob_X2T": prob_X2T,
@@ -217,7 +225,6 @@ def suggest_best_totals(df, prediction):
         return "-"
     recent = df.tail(ROLLING_WINDOW)
     totals = [sum(int(x) for x in s.split()) for s in recent['input'] if s and s != "BOT_PREDICT"]
-    # Loại bỏ outlier bằng cách chỉ lấy các điểm trong rolling window ±1 std
     if totals:
         mean = np.mean(totals)
         std = np.std(totals)
@@ -266,7 +273,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_table()
     now = datetime.now()
     input_time = time.time()
-    # ==== Kiểm tra độ trễ của phiên nhập ====
     last_play = load_last_play()
     delay_warning = False
     if last_play:
@@ -274,7 +280,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if delta > INPUT_DELAY_SEC:
             delay_warning = True
     save_last_play(now)
-    # ==== Xử lý reset/history cũ ====
     if user_id in PENDING_RESET and PENDING_RESET[user_id]:
         if text.upper() == "XÓA HẾT":
             delete_all_history()
@@ -300,7 +305,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_str = f"{numbers[0]} {numbers[1]} {numbers[2]}"
     total = sum(numbers)
     actual = "Tài" if total >= 11 else "Xỉu"
-    # Nếu độ trễ nhập quá lớn, cảnh báo và không update
     if delay_warning:
         await update.message.reply_text("⚠️ Phiên này bạn nhập quá trễ (trên 90s), BOT sẽ không sử dụng dữ liệu này để đảm bảo độ chính xác dự đoán cho phiên tiếp theo.")
         return
@@ -380,20 +384,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tx = "Tài"
             decision_override = True
             reason = f"Markov phát hiện khả năng đảo cầu từ Xỉu sang Tài tăng bất thường."
-    # (Có thể kết hợp thêm rolling momentum, rolling mean biến động mạnh cũng sẽ override nhưng không ép threshold cứng)
 
-    # ==== Lưu dự đoán và trả kết quả ====
     insert_result("BOT_PREDICT", None, tx)
     so_du_doan, dung, sai, tile = summary_stats(fetch_history(10000))
     lines = []
     lines.append(f"✔️ Đã lưu kết quả: {''.join(str(n) for n in numbers)}")
-
-    # ==== Trả lời phân tích kết quả ====
     if decision_override:
         lines.append(f"🔄 BOT tự động đảo cửa: {tx} ({reason})")
     else:
         lines.append(f"🎯 Dự đoán phiên tiếp: {tx} | {cl}")
-
     if abs(tx_proba - 0.5) < 0.1:
         lines.append("⚠️ BOT nhận diện thấy xác suất không rõ ràng, nên cân nhắc nghỉ phiên này!")
     lines.append(f"Dải điểm nên đánh: {dai_diem}")
@@ -412,6 +411,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/predict – Dự đoán phiên tiếp theo\n"
         "/stats – Thống kê hiệu suất dự đoán\n"
         "/reset – Xóa toàn bộ lịch sử data (cần xác nhận)\n"
+        "/exportdata – Xuất toàn bộ lịch sử dự đoán ra file Excel\n"
         "Nhập 3 số kết quả (vd: 456 hoặc 4 5 6) để lưu và cập nhật model.\n"
         "BOT sẽ tự động phát hiện trend, đảo cầu, và cảnh báo khi xác suất đảo chiều tăng bất thường!"
         f"\nNếu nghỉ quá {SESSION_BREAK_MINUTES} phút, bot sẽ tự động yêu cầu nhập tối đa {MIN_SESSION_INPUT} phiên đầu để bắt lại trend session!"
@@ -458,8 +458,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bao_pct = round(bao_proba*100,2)
     else:
         bao_proba = None
-
-    # Markov đánh giá đảo cầu
     markov_info = compute_markov_transition(df_feat_session)
     decision_override = False
     reason = ""
@@ -507,6 +505,26 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Nếu không, nhập bất kỳ ký tự nào khác để hủy."
     )
 
+# ==== LỆNH XUẤT DỮ LIỆU LỊCH SỬ ĐẦY ĐỦ ====
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df = fetch_history_all()  # Không giới hạn số dòng
+    if df.empty:
+        await update.message.reply_text("Không có dữ liệu để xuất.")
+        return
+    df = df.reset_index(drop=True)
+    df.index = df.index + 1
+    df.rename_axis("STT", inplace=True)
+    if "created_at" in df.columns:
+        df['created_at'] = df['created_at'].astype(str)
+    if "input_time" in df.columns:
+        df['input_time'] = df['input_time'].astype(str)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter', options={'strings_to_urls': False}) as writer:
+        df.to_excel(writer, index=True, encoding='utf-8')
+    output.seek(0)
+    await update.message.reply_document(document=output, filename="lich_su_du_doan_Sicbo.xlsx",
+                                       caption="File lịch sử dự đoán (không lỗi font, đủ mọi phiên, mở bằng Excel đều được).")
+
 def main():
     create_table()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -514,6 +532,7 @@ def main():
     app.add_handler(CommandHandler("predict", safe_handler(predict)))
     app.add_handler(CommandHandler("stats", safe_handler(stats)))
     app.add_handler(CommandHandler("reset", safe_handler(reset)))
+    app.add_handler(CommandHandler("exportdata", safe_handler(export_data)))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, safe_handler(handle_message)))
     app.run_polling()
 
