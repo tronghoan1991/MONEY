@@ -33,6 +33,7 @@ LAST_PLAY_FILE = "last_play_time.txt"
 
 MIN_SESSION_INPUT = 10
 SESSION_BREAK_MINUTES = 30
+OVERRIDE_CUTOFF = 0.70
 
 MARKOV_WINDOW = 100
 STREAK_THRESHOLD = 5
@@ -80,8 +81,7 @@ def get_time_block():
         return 'chieu'
     else:
         return 'toi'
-# === PHẦN 2: GHI LỊCH SỬ, TẠO FEATURES, PHÂN PHIÊN ===
-
+# === PHẦN 2: GHI LỊCH SỬ, TẠO FEATURES, PHIÊN CHƠI ===
 def insert_result(input_str, actual, bot_predict=None, input_time=None):
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -211,49 +211,7 @@ def load_models_by_timeblock():
     block = get_time_block()
     path = f"models_{block}.joblib"
     return joblib.load(path) if os.path.exists(path) else None
-# === PHẦN 4: LOGIC DỰ ĐOÁN, MARKOV, STREAK, PROBA ===
-def predict_stacking(X_pred, models, key):
-    if models[key] is None:
-        return 0.5, [0.5, 0.5, 0.5]
-    lr, rf, xgbc = models[key]
-    prob_lr = lr.predict_proba(X_pred)[0][1]
-    prob_rf = rf.predict_proba(X_pred)[0][1]
-    prob_xgb = xgbc.predict_proba(X_pred)[0][1]
-    probs = np.array([prob_lr, prob_rf, prob_xgb])
-    return probs.mean(), probs.tolist()
-
-def compute_markov_transition(df, window=MARKOV_WINDOW):
-    df = df.tail(window)
-    if len(df) < 10:
-        return None
-    seq = df['tai'].tolist()
-    transitions = {'T->T': 0, 'T->X': 0, 'X->T': 0, 'X->X': 0}
-    for i in range(1, len(seq)):
-        prev = 'T' if seq[i - 1] == 1 else 'X'
-        curr = 'T' if seq[i] == 1 else 'X'
-        transitions[f"{prev}->{curr}"] += 1
-
-    total_T = transitions['T->T'] + transitions['T->X']
-    total_X = transitions['X->T'] + transitions['X->X']
-    prob_T2X = transitions['T->X'] / total_T if total_T else 0.0
-    prob_X2T = transitions['X->T'] / total_X if total_X else 0.0
-    last = 'T' if seq[-1] == 1 else 'X'
-
-    return {
-        'prob_T2X': prob_T2X,
-        'prob_X2T': prob_X2T,
-        'last': last
-    }
-
-def get_confidence_label(proba):
-    delta = abs(proba - 0.5)
-    if delta >= 0.15:
-        return "Cao"
-    elif delta >= 0.08:
-        return "Trung bình"
-    else:
-        return "Thấp"
-# === PHẦN 5: TELEGRAM HANDLERS – NHẬP 3 SỐ LIỀN NHAU ===
+# === PHẦN 5: TELEGRAM HANDLERS – NHẬP PHIÊN, RESET ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Gửi 3 số phiên gần nhất (ví dụ: 354) để BOT phân tích.")
@@ -287,7 +245,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_result(" ".join(map(str, numbers)), actual, None, input_time)
     await predict(update, context)
-# === PHẦN 6: PREDICT() – TRẢ LỜI TIẾNG VIỆT TỐI GIẢN ===
+# === PHẦN 6: DỰ ĐOÁN & PHẢN HỒI TIẾNG VIỆT ===
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000)
@@ -319,7 +277,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     override_reason = None
     markov_info = compute_markov_transition(df_feat_session)
-    if markov_info:
+    if markov_info and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         last = markov_info['last']
         if last == "T" and decision == "Tài" and markov_info['prob_T2X'] > markov_info['prob_X2T']:
             decision = "Xỉu"
@@ -328,7 +286,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
             decision = "Tài"
             override_reason = "Markov cho thấy xác suất đảo chiều cao"
 
-    if not override_reason and streak >= STREAK_THRESHOLD:
+    if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         decision = "Xỉu" if decision == "Tài" else "Tài"
         override_reason = f"Chuỗi {('Tài' if decision == 'Xỉu' else 'Xỉu')} liên tiếp ({streak} phiên)"
 
@@ -346,10 +304,10 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
 
     await update.message.reply_text("\n".join(result_msg))
-# === KHỞI CHẠY POLLING TELEGRAM VÀ FLASK ===
+# === PHẦN CUỐI: KHỞI CHẠY FLASK + POLLING ===
+
 if __name__ == "__main__":
     import asyncio
-
     create_table()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -357,8 +315,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Chạy Flask keep-alive song song
+    # Khởi chạy Flask keep-alive song song với Telegram polling
     threading.Thread(target=start_flask, daemon=True).start()
 
-    # Chạy polling Telegram bot
     asyncio.run(app.run_polling())
