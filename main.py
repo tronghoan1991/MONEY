@@ -318,6 +318,5 @@ if __name__ == "__main__":
     # Khởi chạy Flask keep-alive song song với Telegram polling
     threading.Thread(target=start_flask, daemon=True).start()
 
-    asyncio.run(app.run_polling())
     asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
 
