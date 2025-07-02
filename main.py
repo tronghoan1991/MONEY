@@ -300,7 +300,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if confidence == "Thấp":
         result_msg.append("*Lưu ý: Xác suất hiện tại không rõ ràng, cân nhắc không vào*")
     if bao:
-        result_msg.append("⚡ Có thể vào bão (bộ số đồng đều xuất hiện nhiều)")
+        result_msg.append("⚡ Có thể vào bão")
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
 
     await update.message.reply_text("\n".join(result_msg))
