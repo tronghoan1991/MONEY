@@ -81,6 +81,7 @@ def get_time_block():
         return 'chieu'
     else:
         return 'toi'
+
 # === PHẦN 2: GHI LỊCH SỬ, TẠO FEATURES, PHIÊN CHƠI ===
 def insert_result(input_str, actual, bot_predict=None, input_time=None):
     conn = psycopg2.connect(DATABASE_URL)
@@ -177,6 +178,7 @@ def make_features(df):
     df["tai_streak"] = get_streak(df["tai"].tolist())
     df["chan_streak"] = get_streak(df["chan"].tolist())
     return df
+
 # === PHẦN 3: HUẤN LUYỆN VÀ LOAD MODEL THEO GIỜ ===
 def train_models_by_timeblock(df):
     block = get_time_block()
@@ -211,6 +213,37 @@ def load_models_by_timeblock():
     block = get_time_block()
     path = f"models_{block}.joblib"
     return joblib.load(path) if os.path.exists(path) else None
+
+# === PHẦN 4: BỔ SUNG HÀM THIẾU (SỬA LỖI) ===
+
+def predict_stacking(X_pred, models, key):
+    """
+    Trả về xác suất dự đoán stacking trung bình của 3 model (LR, RF, XGB) với nhãn key (tx, cl, bao).
+    """
+    if models is None or key not in models or models[key] is None:
+        return 0.5, None
+    lr, rf, xgbc = models[key]
+    probas = []
+    for model in (lr, rf, xgbc):
+        try:
+            proba = model.predict_proba(X_pred)[:, 1][0]
+        except Exception:
+            proba = 0.5
+        probas.append(proba)
+    avg_proba = float(np.mean(probas))
+    return avg_proba, probas
+
+def get_confidence_label(proba):
+    if proba >= 0.75 or proba <= 0.25:
+        return "Cao"
+    elif proba >= 0.6 or proba <= 0.4:
+        return "Trung bình"
+    else:
+        return "Thấp"
+
+def compute_markov_transition(df):
+    return None
+
 # === PHẦN 5: TELEGRAM HANDLERS – NHẬP PHIÊN, RESET ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,6 +278,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_result(" ".join(map(str, numbers)), actual, None, input_time)
     await predict(update, context)
+
 # === PHẦN 6: DỰ ĐOÁN & PHẢN HỒI TIẾNG VIỆT ===
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -304,6 +338,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
 
     await update.message.reply_text("\n".join(result_msg))
+
 # === PHẦN CUỐI: KHỞI CHẠY FLASK + POLLING ===
 
 if __name__ == "__main__":
@@ -319,4 +354,3 @@ if __name__ == "__main__":
     threading.Thread(target=start_flask, daemon=True).start()
 
     asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
-
