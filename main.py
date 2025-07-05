@@ -301,8 +301,36 @@ def predict_stacking(X_pred, models, weights):
     avg_proba = float(np.dot(probas, weights))
     return avg_proba, probas
 
+def suggest_best_range(recent_totals, from_num, to_num, length=3):
+    counts = {i: 0 for i in range(from_num, to_num+1)}
+    for t in recent_totals:
+        if from_num <= t <= to_num:
+            counts[t] += 1
+    best_range = (from_num, from_num+length-1)
+    best_sum = sum([counts[i] for i in range(from_num, from_num+length)])
+    for start in range(from_num, to_num-length+2):
+        curr_sum = sum([counts[i] for i in range(start, start+length)])
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_range = (start, start+length-1)
+    return best_range
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Gửi 3 số phiên gần nhất (ví dụ: 354) để BOT phân tích.")
+    menu_text = (
+        "🎲 **BOT DỰ ĐOÁN SICBO - MENU LỆNH** 🎲\n"
+        "\n"
+        "Các lệnh & chức năng sẵn có:\n"
+        "• Gửi 3 số phiên gần nhất (ví dụ: `354` hoặc `4 5 3`) để nhập kết quả thực tế và nhận dự đoán phiên tiếp theo\n"
+        "• /start — Hiển thị menu các lệnh (bạn đang xem)\n"
+        "• /reset — Reset lại phiên chơi, bắt đầu thống kê mới\n"
+        "\n"
+        "👉 **Hướng dẫn nhanh:**\n"
+        "- Gửi đúng định dạng 3 số liên tiếp (vd: 345) hoặc cách nhau bởi dấu cách (vd: 3 4 5)\n"
+        "- BOT sẽ lưu kết quả, tự động thống kê & dự đoán phiên kế tiếp.\n"
+        "\n"
+        "Chúc bạn may mắn và quản lý vốn thông minh! 🚦"
+    )
+    await update.message.reply_text(menu_text, parse_mode="Markdown")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(SESSION_FILE):
@@ -365,7 +393,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bao = int(X_pred["bao_roll"].values[0] > 0.2)
     streak = int(X_pred["tai_streak"].values[0])
 
-    explain_msg = "; ".join([f"Model{i+1}: {probas[i]:.2f} (w={weights[i]:.2f})" for i in range(3)])
     risk_note = ""
     if abs(tx_proba-0.5) < 0.1:
         risk_note = "⚠️ Xác suất quá thấp, không nên vào lệnh."
@@ -389,11 +416,21 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_result_return_id("BOT_PREDICT", None, decision)
 
+    # --------- Gợi ý dải điểm nên đánh ----------
+    recent_totals = df_feat_session['total'].dropna().astype(int).tolist()[-50:]
+    if decision == "Xỉu":
+        g_range = suggest_best_range(recent_totals, 4, 10, length=3)
+        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
+    else:
+        g_range = suggest_best_range(recent_totals, 11, 17, length=3)
+        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
+    # -------------------------------------------
+
     total, correct, wrong, acc = summary_stats(df)
     result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
     if override_reason:
         result_msg.insert(1, f"Lý do: {override_reason}")
-    result_msg.append(f"Stacking: {explain_msg}")
+    result_msg.append(range_text)
     if risk_note:
         result_msg.append(risk_note)
     if bao:
