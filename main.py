@@ -120,8 +120,9 @@ def fetch_history(limit=10000):
         print("Lỗi khi lấy lịch sử:", e)
         return pd.DataFrame()
 
+# ==== ĐÃ SỬA: Chỉ đếm số phiên dự đoán khi input == "BOT_PREDICT" ====
 def summary_stats(df):
-    df_pred = df[(df["bot_predict"].notnull()) & (df["actual"].notnull())]
+    df_pred = df[df["input"] == "BOT_PREDICT"]  # Chỉ đếm dòng dự đoán
     correct = (df_pred["bot_predict"] == df_pred["actual"]).sum()
     total = len(df_pred)
     wrong = total - correct
@@ -390,9 +391,9 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total, correct, wrong, acc = summary_stats(df)
     result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
-    result_msg.append(f"Stacking: {explain_msg}")
     if override_reason:
         result_msg.insert(1, f"Lý do: {override_reason}")
+    result_msg.append(f"Stacking: {explain_msg}")
     if risk_note:
         result_msg.append(risk_note)
     if bao:
