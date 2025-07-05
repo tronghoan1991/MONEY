@@ -25,17 +25,16 @@ ROLLING_WINDOW = 12
 MIN_BATCH = 5
 TRAIN_EVERY = 5
 
-MODEL_PATH = "ml_stack.joblib"
+MODEL_PATH = "ml_stack_point.joblib"
 SESSION_FILE = "session_time.txt"
 LAST_PLAY_FILE = "last_play_time.txt"
 
 MIN_SESSION_INPUT = 10
 SESSION_BREAK_MINUTES = 30
-OVERRIDE_CUTOFF = 0.70
-
 MARKOV_WINDOW = 100
 STREAK_THRESHOLD = 5
-LAST_N_ACCURACY = 50
+
+POINTS = list(range(4, 18))  # tổng điểm từ 4 tới 17
 
 def start_flask():
     app = Flask(__name__)
@@ -212,73 +211,30 @@ def make_features(df):
     return df
 
 FEATURES = [
-    'total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
+    'n1', 'n2', 'n3', 'total', 'even', 'bao',
+    'tai', 'xiu', 'chan', 'le',
+    'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
     'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
     'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
     'tai_streak', 'chan_streak'
 ]
 
-def train_models_by_timeblock(df, save_path=None):
-    block = get_time_block()
-    path = save_path if save_path else f"models_{block}.joblib"
-    df = df.tail(ROLLING_WINDOW * 10)
+def train_point_model(df, save_path=MODEL_PATH):
+    # Train model dự đoán tổng điểm (4-17)
+    df = df.tail(ROLLING_WINDOW * 20)
     X = df[FEATURES].fillna(0)
-    y_tx = df['tai']
-    models = []
-    models.append(LogisticRegression().fit(X, y_tx))
-    models.append(RandomForestClassifier(n_estimators=100).fit(X, y_tx))
-    models.append(xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y_tx))
-    joblib.dump(models, path)
-    return path
+    y = df['total'].astype(int)
+    model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
+    model.fit(X, y)
+    joblib.dump(model, save_path)
+    return save_path
 
-def load_models_by_timeblock():
-    block = get_time_block()
-    path = f"models_{block}.joblib"
+def load_point_model():
+    path = MODEL_PATH
     if os.path.exists(path):
         return joblib.load(path)
     else:
         return None
-
-def update_stacking_weights(df, models):
-    if models is None or len(models) != 3:
-        return [1/3, 1/3, 1/3]
-    df = df.tail(LAST_N_ACCURACY)
-    if len(df) < 10:
-        return [1/3, 1/3, 1/3]
-    X = df[FEATURES].fillna(0)
-    y = df['tai']
-    accs = []
-    for model in models:
-        try:
-            preds = model.predict(X)
-            acc = (preds == y).mean()
-        except Exception:
-            acc = 1/3
-        accs.append(max(acc, 0.01))
-    s = sum(accs)
-    return [a/s for a in accs]
-
-def compute_markov_transition(df):
-    seq = df['tai'].dropna().astype(int).tolist()
-    if len(seq) < 2:
-        return None
-    T2T = T2X = X2T = X2X = 0
-    for i in range(1, len(seq)):
-        prev, curr = seq[i-1], seq[i]
-        if prev == 1 and curr == 1: T2T += 1
-        elif prev == 1 and curr == 0: T2X += 1
-        elif prev == 0 and curr == 1: X2T += 1
-        elif prev == 0 and curr == 0: X2X += 1
-    t_count = sum(1 for x in seq[:-1] if x == 1)
-    x_count = sum(1 for x in seq[:-1] if x == 0)
-    last = seq[-1]
-    return {
-        'last': 'T' if last == 1 else 'X',
-        'prob_T2T': T2T / t_count if t_count else 0.5,
-        'prob_T2X': T2X / t_count if t_count else 0.5,
-        'prob_X2T': X2T / x_count if x_count else 0.5,
-        'prob_X2X': X2X / x_count if x_count else 0.5
-    }
 
 def get_confidence_label(proba):
     if proba >= 0.8 or proba <= 0.2:
@@ -290,29 +246,17 @@ def get_confidence_label(proba):
     else:
         return "Thấp"
 
-def predict_stacking(X_pred, models, weights):
-    probas = []
-    for model in models:
-        try:
-            proba = model.predict_proba(X_pred)[:, 1][0]
-        except Exception:
-            proba = 0.5
-        probas.append(proba)
-    avg_proba = float(np.dot(probas, weights))
-    return avg_proba, probas
-
-def suggest_best_range(recent_totals, from_num, to_num, length=3):
-    counts = {i: 0 for i in range(from_num, to_num+1)}
-    for t in recent_totals:
-        if from_num <= t <= to_num:
-            counts[t] += 1
+def suggest_best_range_point(pred_prob_dict, from_num, to_num, length=3):
+    # pred_prob_dict: {point: xác suất}
     best_range = (from_num, from_num+length-1)
-    best_sum = sum([counts[i] for i in range(from_num, from_num+length)])
-    for start in range(from_num, to_num-length+2):
-        curr_sum = sum([counts[i] for i in range(start, start+length)])
+    keys = list(range(from_num, to_num+1))
+    vals = [pred_prob_dict.get(k, 0) for k in keys]
+    best_sum = sum(vals[:length])
+    for i in range(0, len(vals)-length+1):
+        curr_sum = sum(vals[i:i+length])
         if curr_sum > best_sum:
             best_sum = curr_sum
-            best_range = (start, start+length-1)
+            best_range = (keys[i], keys[i+length-1])
     return best_range
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,60 +320,56 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
 
-    if len(df_feat) >= 30 and (not os.path.exists(f"models_{get_time_block()}.joblib")):
-        train_models_by_timeblock(df_feat)
+    if len(df_feat) >= 50 and (not os.path.exists(MODEL_PATH)):
+        train_point_model(df_feat)
 
-    models = load_models_by_timeblock()
-    if models is None or len(models) != 3:
+    model = load_point_model()
+    if model is None:
         await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
         return
 
-    weights = update_stacking_weights(df_feat, models)
-
+    # Predict xác suất từng tổng điểm (4–17)
     X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
-    tx_proba, probas = predict_stacking(X_pred, models, weights)
-    decision = "Tài" if tx_proba >= 0.5 else "Xỉu"
-    confidence = get_confidence_label(tx_proba)
-    bao = int(X_pred["bao_roll"].values[0] > 0.2)
-    streak = int(X_pred["tai_streak"].values[0])
+    try:
+        proba_all = model.predict_proba(X_pred)[0]
+        classes = model.classes_
+    except Exception:
+        await update.message.reply_text("⚠️ Model lỗi, cần nhập thêm phiên hoặc retrain.")
+        return
+    prob_dict = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
 
+    # Tài/Xỉu từ tổng điểm (11–17, 4–10)
+    prob_tai = sum([prob_dict.get(pt, 0) for pt in range(11, 18)])
+    prob_xiu = sum([prob_dict.get(pt, 0) for pt in range(4, 11)])
+
+    # Decision & confidence
+    if prob_tai >= prob_xiu:
+        decision = "Tài"
+        tx_proba = prob_tai
+        g_range = suggest_best_range_point(prob_dict, 11, 17, length=3)
+        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
+    else:
+        decision = "Xỉu"
+        tx_proba = prob_xiu
+        g_range = suggest_best_range_point(prob_dict, 4, 10, length=3)
+        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
+
+    confidence = get_confidence_label(tx_proba)
     risk_note = ""
     if abs(tx_proba-0.5) < 0.1:
         risk_note = "⚠️ Xác suất quá thấp, không nên vào lệnh."
     elif abs(tx_proba-0.5) < 0.2:
         risk_note = "⚠️ Xác suất thấp, cân nhắc kỹ."
 
+    # Bạn có thể thêm các logic Markov, streak... nếu muốn
+    bao = int(X_pred["bao_roll"].values[0] > 0.2)
+    streak = int(X_pred["tai_streak"].values[0])
     override_reason = None
-    markov_info = compute_markov_transition(df_feat_session)
-    if markov_info and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
-        last = markov_info['last']
-        if last == "T" and decision == "Tài" and markov_info['prob_T2X'] > markov_info['prob_T2T']:
-            decision = "Xỉu"
-            override_reason = "Xác suất đảo chiều cao"
-        elif last == "X" and decision == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_X2X']:
-            decision = "Tài"
-            override_reason = "Xác suất đảo chiều cao"
-
-    if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
-        decision = "Xỉu" if decision == "Tài" else "Tài"
-        override_reason = f"Chuỗi {('Tài' if decision == 'Xỉu' else 'Xỉu')} liên tiếp ({streak} phiên)"
 
     insert_result_return_id("BOT_PREDICT", None, decision)
 
-    # --------- Gợi ý dải điểm nên đánh ----------
-    recent_totals = df_feat_session['total'].dropna().astype(int).tolist()[-50:]
-    if decision == "Xỉu":
-        g_range = suggest_best_range(recent_totals, 4, 10, length=3)
-        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
-    else:
-        g_range = suggest_best_range(recent_totals, 11, 17, length=3)
-        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
-    # -------------------------------------------
-
     total, correct, wrong, acc = summary_stats(df)
     result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
-    if override_reason:
-        result_msg.insert(1, f"Lý do: {override_reason}")
     result_msg.append(range_text)
     if risk_note:
         result_msg.append(risk_note)
