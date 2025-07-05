@@ -1,4 +1,3 @@
-# === PHẦN 1: IMPORT, CẤU HÌNH, DB, FLASK, TIMEBLOCK ===
 import os
 import pandas as pd
 import psycopg2
@@ -11,8 +10,6 @@ import joblib
 import threading
 import time
 import warnings
-import traceback
-import io
 import numpy as np
 from flask import Flask
 from sklearn.linear_model import LogisticRegression
@@ -21,7 +18,6 @@ import xgboost as xgb
 
 warnings.filterwarnings('ignore')
 
-# ==== CẤU HÌNH ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -52,7 +48,6 @@ def start_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# ==== KHỞI TẠO DATABASE ====
 def create_table():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -78,7 +73,6 @@ def create_table():
     except Exception as e:
         print("Lỗi khi tạo database:", e)
 
-# ==== XÁC ĐỊNH KHUNG GIỜ ====
 def get_time_block():
     hour = datetime.now().hour
     if 5 <= hour <= 11:
@@ -88,7 +82,6 @@ def get_time_block():
     else:
         return 'toi'
 
-# === PHẦN 2: GHI LỊCH SỬ, TẠO FEATURES, PHIÊN CHƠI ===
 def insert_result(input_str, actual, bot_predict=None, input_time=None):
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -110,6 +103,24 @@ def insert_result(input_str, actual, bot_predict=None, input_time=None):
     except Exception as e:
         print("Lỗi khi ghi lịch sử:", e)
 
+def update_last_bot_predict_actual(actual_value):
+    # Tự động cập nhật actual cho BOT_PREDICT chưa có actual (tức là phiên dự đoán gần nhất)
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE history
+            SET actual = %s
+            WHERE id = (
+                SELECT id FROM history WHERE input = 'BOT_PREDICT' AND actual IS NULL ORDER BY id ASC LIMIT 1
+            )
+        """, (actual_value,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("Lỗi cập nhật actual cho BOT_PREDICT:", e)
+
 def fetch_history(limit=10000):
     try:
         engine = create_engine(DATABASE_URL)
@@ -120,7 +131,6 @@ def fetch_history(limit=10000):
         print("Lỗi khi lấy lịch sử:", e)
         return pd.DataFrame()
 
-# ==== ĐÃ SỬA: Chỉ đếm số phiên dự đoán khi input == "BOT_PREDICT" ====
 def summary_stats(df):
     df_pred = df[df["input"] == "BOT_PREDICT"]  # Chỉ đếm dòng dự đoán
     correct = (df_pred["bot_predict"] == df_pred["actual"]).sum()
@@ -200,7 +210,6 @@ def make_features(df):
     df["chan_streak"] = get_streak(df["chan"].tolist())
     return df
 
-# === PHẦN 3: HUẤN LUYỆN, LOAD VÀ TỰ ĐỘNG ĐIỀU CHỈNH MODEL ===
 FEATURES = [
     'total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
     'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
@@ -231,7 +240,6 @@ def load_models_by_timeblock():
         return None
 
 def update_stacking_weights(df, models):
-    """Tự động tính trọng số stacking dựa trên hiệu quả thực tế 50 phiên gần nhất."""
     if models is None or len(models) != 3:
         return [1/3, 1/3, 1/3]
     df = df.tail(LAST_N_ACCURACY)
@@ -283,7 +291,6 @@ def get_confidence_label(proba):
         return "Thấp"
 
 def predict_stacking(X_pred, models, weights):
-    """Dự đoán stacking có weights."""
     probas = []
     for model in models:
         try:
@@ -293,8 +300,6 @@ def predict_stacking(X_pred, models, weights):
         probas.append(proba)
     avg_proba = float(np.dot(probas, weights))
     return avg_proba, probas
-
-# === PHẦN 5: TELEGRAM HANDLERS – NHẬP PHIÊN, RESET ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Gửi 3 số phiên gần nhất (ví dụ: 354) để BOT phân tích.")
@@ -327,16 +332,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_last_play(now)
 
     insert_result(" ".join(map(str, numbers)), actual, None, input_time)
+    # Gán actual cho dòng BOT_PREDICT gần nhất
+    update_last_bot_predict_actual(actual)
     await predict(update, context)
-
-# === PHẦN 6: DỰ ĐOÁN & PHÂN TÍCH NÂNG CAO ===
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000)
     session_start = load_session_start()
     df_session = df[df['created_at'] >= session_start] if session_start else df
 
-    # Đủ dữ liệu chưa
     if len(df_session[df_session['input'] != "BOT_PREDICT"]) < MIN_SESSION_INPUT:
         await update.message.reply_text(f"⚠️ Cần tối thiểu {MIN_SESSION_INPUT} phiên để dự đoán.")
         return
@@ -344,7 +348,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
 
-    # Tự động train lại model nếu chưa có
     if len(df_feat) >= 30 and (not os.path.exists(f"models_{get_time_block()}.joblib")):
         train_models_by_timeblock(df_feat)
 
@@ -353,7 +356,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
         return
 
-    # Auto-update weights stacking dựa vào hiệu quả thực tế
     weights = update_stacking_weights(df_feat, models)
 
     X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
@@ -370,7 +372,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif abs(tx_proba-0.5) < 0.2:
         risk_note = "⚠️ Xác suất thấp, cân nhắc kỹ."
 
-    # Markov override
     override_reason = None
     markov_info = compute_markov_transition(df_feat_session)
     if markov_info and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
@@ -382,7 +383,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
             decision = "Tài"
             override_reason = "Markov: Xác suất đảo chiều cao"
 
-    # Streak override
     if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         decision = "Xỉu" if decision == "Tài" else "Tài"
         override_reason = f"Chuỗi {('Tài' if decision == 'Xỉu' else 'Xỉu')} liên tiếp ({streak} phiên)"
@@ -401,8 +401,6 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
 
     await update.message.reply_text("\n".join(result_msg))
-
-# === PHẦN CUỐI: KHỞI CHẠY FLASK + POLLING ===
 
 if __name__ == "__main__":
     import asyncio
