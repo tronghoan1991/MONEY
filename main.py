@@ -22,19 +22,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 ROLLING_WINDOW = 12
-MIN_BATCH = 5
-TRAIN_EVERY = 5
-
 MODEL_PATH = "ml_stack_point.joblib"
 SESSION_FILE = "session_time.txt"
 LAST_PLAY_FILE = "last_play_time.txt"
 
 MIN_SESSION_INPUT = 10
 SESSION_BREAK_MINUTES = 30
-MARKOV_WINDOW = 100
-STREAK_THRESHOLD = 5
 
 POINTS = list(range(4, 18))  # tổng điểm từ 4 tới 17
+TRAIN_LIMIT = 2000           # rolling window phù hợp RAM free server
 
 def start_flask():
     app = Flask(__name__)
@@ -121,11 +117,12 @@ def update_prev_bot_predict_actual(actual_value, id_current):
     except Exception as e:
         print("Lỗi cập nhật actual cho BOT_PREDICT:", e)
 
-def fetch_history(limit=10000):
+def fetch_history(limit=TRAIN_LIMIT):
     try:
         engine = create_engine(DATABASE_URL)
-        df = pd.read_sql("SELECT * FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
+        df = pd.read_sql("SELECT * FROM history ORDER BY id DESC LIMIT %s" % limit, engine)
         engine.dispose()
+        df = df.sort_values('id')  # đảm bảo đúng thứ tự thời gian
         return df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False) | (df["input"] == "BOT_PREDICT")]
     except Exception as e:
         print("Lỗi khi lấy lịch sử:", e)
@@ -220,14 +217,12 @@ FEATURES = [
 ]
 
 def train_point_model(df, save_path=MODEL_PATH):
-    # Train model dự đoán tổng điểm (4-17)
-    df = df.tail(ROLLING_WINDOW * 20)
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
     model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
     model.fit(X, y)
     joblib.dump(model, save_path)
-    return save_path
+    return None
 
 def load_point_model():
     path = MODEL_PATH
@@ -247,7 +242,6 @@ def get_confidence_label(proba):
         return "Thấp"
 
 def suggest_best_range_point(pred_prob_dict, from_num, to_num, length=3):
-    # pred_prob_dict: {point: xác suất}
     best_range = (from_num, from_num+length-1)
     keys = list(range(from_num, to_num+1))
     vals = [pred_prob_dict.get(k, 0) for k in keys]
@@ -309,7 +303,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await predict(update, context)
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = fetch_history(10000)
+    df = fetch_history()
     session_start = load_session_start()
     df_session = df[df['created_at'] >= session_start] if session_start else df
 
@@ -320,15 +314,15 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
 
-    if len(df_feat) >= 50 and (not os.path.exists(MODEL_PATH)):
-        train_point_model(df_feat)
-
     model = load_point_model()
+    if model is None or (len(df_feat) % 100 == 0 and len(df_feat) > 0):
+        train_point_model(df_feat)
+        model = load_point_model()
+
     if model is None:
         await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
         return
 
-    # Predict xác suất từng tổng điểm (4–17)
     X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
     try:
         proba_all = model.predict_proba(X_pred)[0]
@@ -337,12 +331,14 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Model lỗi, cần nhập thêm phiên hoặc retrain.")
         return
     prob_dict = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
+    # Nếu thiếu tổng điểm nào thì cho xác suất = 0 (không bao giờ báo lỗi)
+    for pt in range(4, 18):
+        if pt not in prob_dict:
+            prob_dict[pt] = 0.0
 
-    # Tài/Xỉu từ tổng điểm (11–17, 4–10)
     prob_tai = sum([prob_dict.get(pt, 0) for pt in range(11, 18)])
     prob_xiu = sum([prob_dict.get(pt, 0) for pt in range(4, 11)])
 
-    # Decision & confidence
     if prob_tai >= prob_xiu:
         decision = "Tài"
         tx_proba = prob_tai
@@ -361,10 +357,8 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif abs(tx_proba-0.5) < 0.2:
         risk_note = "⚠️ Xác suất thấp, cân nhắc kỹ."
 
-    # Bạn có thể thêm các logic Markov, streak... nếu muốn
     bao = int(X_pred["bao_roll"].values[0] > 0.2)
     streak = int(X_pred["tai_streak"].values[0])
-    override_reason = None
 
     insert_result_return_id("BOT_PREDICT", None, decision)
 
