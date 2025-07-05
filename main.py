@@ -35,9 +35,8 @@ OVERRIDE_CUTOFF = 0.70
 
 MARKOV_WINDOW = 100
 STREAK_THRESHOLD = 5
-LAST_N_ACCURACY = 50  # số phiên gần nhất để update weight stacking
+LAST_N_ACCURACY = 50
 
-# ==== FLASK KEEP-ALIVE ====
 def start_flask():
     app = Flask(__name__)
 
@@ -82,7 +81,8 @@ def get_time_block():
     else:
         return 'toi'
 
-def insert_result(input_str, actual, bot_predict=None, input_time=None):
+def insert_result_return_id(input_str, actual, bot_predict=None, input_time=None):
+    result_id = None
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -90,31 +90,32 @@ def insert_result(input_str, actual, bot_predict=None, input_time=None):
         if bot_predict is not None:
             cur.execute("""
                 INSERT INTO history (input, actual, bot_predict, created_at, input_time)
-                VALUES (%s, %s, %s, %s, %s);
+                VALUES (%s, %s, %s, %s, %s) RETURNING id;
             """, (input_str, actual, bot_predict, now, input_time))
         else:
             cur.execute("""
                 INSERT INTO history (input, actual, created_at, input_time)
-                VALUES (%s, %s, %s, %s);
+                VALUES (%s, %s, %s, %s) RETURNING id;
             """, (input_str, actual, now, input_time))
+        result_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
         print("Lỗi khi ghi lịch sử:", e)
+    return result_id
 
-def update_last_bot_predict_actual(actual_value):
-    # Tự động cập nhật actual cho BOT_PREDICT chưa có actual (tức là phiên dự đoán gần nhất)
+def update_prev_bot_predict_actual(actual_value, id_current):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute("""
             UPDATE history
             SET actual = %s
-            WHERE id = (
-                SELECT id FROM history WHERE input = 'BOT_PREDICT' AND actual IS NULL ORDER BY id ASC LIMIT 1
-            )
-        """, (actual_value,))
+            WHERE input = 'BOT_PREDICT' AND id < %s AND actual IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+        """, (actual_value, id_current))
         conn.commit()
         cur.close()
         conn.close()
@@ -132,7 +133,7 @@ def fetch_history(limit=10000):
         return pd.DataFrame()
 
 def summary_stats(df):
-    df_pred = df[df["input"] == "BOT_PREDICT"]  # Chỉ đếm dòng dự đoán
+    df_pred = df[df["input"] == "BOT_PREDICT"]
     correct = (df_pred["bot_predict"] == df_pred["actual"]).sum()
     total = len(df_pred)
     wrong = total - correct
@@ -221,7 +222,6 @@ def train_models_by_timeblock(df, save_path=None):
     block = get_time_block()
     path = save_path if save_path else f"models_{block}.joblib"
     df = df.tail(ROLLING_WINDOW * 10)
-
     X = df[FEATURES].fillna(0)
     y_tx = df['tai']
     models = []
@@ -331,9 +331,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_session_start(now)
     save_last_play(now)
 
-    insert_result(" ".join(map(str, numbers)), actual, None, input_time)
-    # Gán actual cho dòng BOT_PREDICT gần nhất
-    update_last_bot_predict_actual(actual)
+    result_id = insert_result_return_id(" ".join(map(str, numbers)), actual, None, input_time)
+    if result_id is not None:
+        update_prev_bot_predict_actual(actual, result_id)
     await predict(update, context)
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,16 +378,16 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last = markov_info['last']
         if last == "T" and decision == "Tài" and markov_info['prob_T2X'] > markov_info['prob_T2T']:
             decision = "Xỉu"
-            override_reason = "Markov: Xác suất đảo chiều cao"
+            override_reason = "Xác suất đảo chiều cao"
         elif last == "X" and decision == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_X2X']:
             decision = "Tài"
-            override_reason = "Markov: Xác suất đảo chiều cao"
+            override_reason = "Xác suất đảo chiều cao"
 
     if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         decision = "Xỉu" if decision == "Tài" else "Tài"
         override_reason = f"Chuỗi {('Tài' if decision == 'Xỉu' else 'Xỉu')} liên tiếp ({streak} phiên)"
 
-    insert_result("BOT_PREDICT", None, decision)
+    insert_result_return_id("BOT_PREDICT", None, decision)
 
     total, correct, wrong, acc = summary_stats(df)
     result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
@@ -405,11 +405,9 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     import asyncio
     create_table()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     threading.Thread(target=start_flask, daemon=True).start()
     asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
