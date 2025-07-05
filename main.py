@@ -19,6 +19,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
+warnings.filterwarnings('ignore')
+
 # ==== CẤU HÌNH ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -37,6 +39,7 @@ OVERRIDE_CUTOFF = 0.70
 
 MARKOV_WINDOW = 100
 STREAK_THRESHOLD = 5
+LAST_N_ACCURACY = 50  # số phiên gần nhất để update weight stacking
 
 # ==== FLASK KEEP-ALIVE ====
 def start_flask():
@@ -160,6 +163,7 @@ def load_last_play():
 def make_features(df):
     df = df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False)].copy()
     def extract_numbers(x):
+        x = str(x)
         if " " in x:
             return list(map(int, x.split()))
         elif len(x) == 3 and x.isdigit():
@@ -195,42 +199,55 @@ def make_features(df):
     df["chan_streak"] = get_streak(df["chan"].tolist())
     return df
 
-# === PHẦN 3: HUẤN LUYỆN VÀ LOAD MODEL THEO GIỜ ===
-def train_models_by_timeblock(df):
+# === PHẦN 3: HUẤN LUYỆN, LOAD VÀ TỰ ĐỘNG ĐIỀU CHỈNH MODEL ===
+FEATURES = [
+    'total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
+    'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
+    'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
+    'tai_streak', 'chan_streak'
+]
+
+def train_models_by_timeblock(df, save_path=None):
     block = get_time_block()
-    path = f"models_{block}.joblib"
+    path = save_path if save_path else f"models_{block}.joblib"
     df = df.tail(ROLLING_WINDOW * 10)
 
-    features = [
-        'total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
-        'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
-        'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
-        'tai_streak', 'chan_streak'
-    ]
-    X = df[features].fillna(0)
+    X = df[FEATURES].fillna(0)
     y_tx = df['tai']
-    y_cl = df['chan']
-    y_bao = df['bao']
-
-    models = {}
-    for key, y in [('tx', y_tx), ('cl', y_cl), ('bao', y_bao)]:
-        if len(set(y)) < 2:
-            models[key] = None
-            continue
-        lr = LogisticRegression().fit(X, y)
-        rf = RandomForestClassifier(n_estimators=100).fit(X, y)
-        xgbc = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y)
-        models[key] = (lr, rf, xgbc)
-
+    models = []
+    models.append(LogisticRegression().fit(X, y_tx))
+    models.append(RandomForestClassifier(n_estimators=100).fit(X, y_tx))
+    models.append(xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='logloss').fit(X, y_tx))
     joblib.dump(models, path)
     return path
 
 def load_models_by_timeblock():
     block = get_time_block()
     path = f"models_{block}.joblib"
-    return joblib.load(path) if os.path.exists(path) else None
+    if os.path.exists(path):
+        return joblib.load(path)
+    else:
+        return None
 
-# === PHẦN 4: THUẬT TOÁN NÂNG CAO (MARKOV, STACKING, CONFIDENCE) ===
+def update_stacking_weights(df, models):
+    """Tự động tính trọng số stacking dựa trên hiệu quả thực tế 50 phiên gần nhất."""
+    if models is None or len(models) != 3:
+        return [1/3, 1/3, 1/3]
+    df = df.tail(LAST_N_ACCURACY)
+    if len(df) < 10:
+        return [1/3, 1/3, 1/3]
+    X = df[FEATURES].fillna(0)
+    y = df['tai']
+    accs = []
+    for model in models:
+        try:
+            preds = model.predict(X)
+            acc = (preds == y).mean()
+        except Exception:
+            acc = 1/3
+        accs.append(max(acc, 0.01))
+    s = sum(accs)
+    return [a/s for a in accs]
 
 def compute_markov_transition(df):
     seq = df['tai'].dropna().astype(int).tolist()
@@ -239,15 +256,10 @@ def compute_markov_transition(df):
     T2T = T2X = X2T = X2X = 0
     for i in range(1, len(seq)):
         prev, curr = seq[i-1], seq[i]
-        if prev == 1 and curr == 1:
-            T2T += 1
-        elif prev == 1 and curr == 0:
-            T2X += 1
-        elif prev == 0 and curr == 1:
-            X2T += 1
-        elif prev == 0 and curr == 0:
-            X2X += 1
-
+        if prev == 1 and curr == 1: T2T += 1
+        elif prev == 1 and curr == 0: T2X += 1
+        elif prev == 0 and curr == 1: X2T += 1
+        elif prev == 0 and curr == 0: X2X += 1
     t_count = sum(1 for x in seq[:-1] if x == 1)
     x_count = sum(1 for x in seq[:-1] if x == 0)
     last = seq[-1]
@@ -259,23 +271,6 @@ def compute_markov_transition(df):
         'prob_X2X': X2X / x_count if x_count else 0.5
     }
 
-def predict_stacking(X_pred, models, key, weights=(0.33, 0.33, 0.34)):
-    """
-    Weighted stacking xác suất 3 model (LR, RF, XGB). Weights sum to 1.
-    """
-    if models is None or key not in models or models[key] is None:
-        return 0.5, None
-    lr, rf, xgbc = models[key]
-    probas = []
-    for model in (lr, rf, xgbc):
-        try:
-            proba = model.predict_proba(X_pred)[:, 1][0]
-        except Exception:
-            proba = 0.5
-        probas.append(proba)
-    avg_proba = float(np.dot(probas, weights))
-    return avg_proba, probas
-
 def get_confidence_label(proba):
     if proba >= 0.8 or proba <= 0.2:
         return "Rất cao"
@@ -285,6 +280,18 @@ def get_confidence_label(proba):
         return "Trung bình"
     else:
         return "Thấp"
+
+def predict_stacking(X_pred, models, weights):
+    """Dự đoán stacking có weights."""
+    probas = []
+    for model in models:
+        try:
+            proba = model.predict_proba(X_pred)[:, 1][0]
+        except Exception:
+            proba = 0.5
+        probas.append(proba)
+    avg_proba = float(np.dot(probas, weights))
+    return avg_proba, probas
 
 # === PHẦN 5: TELEGRAM HANDLERS – NHẬP PHIÊN, RESET ===
 
@@ -321,36 +328,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     insert_result(" ".join(map(str, numbers)), actual, None, input_time)
     await predict(update, context)
 
-# === PHẦN 6: DỰ ĐOÁN & PHẢN HỒI TIẾNG VIỆT ===
+# === PHẦN 6: DỰ ĐOÁN & PHÂN TÍCH NÂNG CAO ===
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = fetch_history(10000)
     session_start = load_session_start()
     df_session = df[df['created_at'] >= session_start] if session_start else df
 
+    # Đủ dữ liệu chưa
     if len(df_session[df_session['input'] != "BOT_PREDICT"]) < MIN_SESSION_INPUT:
         await update.message.reply_text(f"⚠️ Cần tối thiểu {MIN_SESSION_INPUT} phiên để dự đoán.")
         return
 
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
+
+    # Tự động train lại model nếu chưa có
+    if len(df_feat) >= 30 and (not os.path.exists(f"models_{get_time_block()}.joblib")):
+        train_models_by_timeblock(df_feat)
+
     models = load_models_by_timeblock()
+    if models is None or len(models) != 3:
+        await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
+        return
 
-    features = ['total', 'even', 'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
-                'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
-                'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
-                'tai_streak', 'chan_streak']
-    X_pred = df_feat_session.iloc[[-1]][features].fillna(0)
+    # Auto-update weights stacking dựa vào hiệu quả thực tế
+    weights = update_stacking_weights(df_feat, models)
 
-    tx_proba, _ = predict_stacking(X_pred, models, 'tx')
-    cl_proba, _ = predict_stacking(X_pred, models, 'cl')
-
+    X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
+    tx_proba, probas = predict_stacking(X_pred, models, weights)
     decision = "Tài" if tx_proba >= 0.5 else "Xỉu"
-    total_value = int(X_pred["total"].values[0])
     confidence = get_confidence_label(tx_proba)
     bao = int(X_pred["bao_roll"].values[0] > 0.2)
     streak = int(X_pred["tai_streak"].values[0])
 
+    explain_msg = "; ".join([f"Model{i+1}: {probas[i]:.2f} (w={weights[i]:.2f})" for i in range(3)])
+    risk_note = ""
+    if abs(tx_proba-0.5) < 0.1:
+        risk_note = "⚠️ Xác suất quá thấp, không nên vào lệnh."
+    elif abs(tx_proba-0.5) < 0.2:
+        risk_note = "⚠️ Xác suất thấp, cân nhắc kỹ."
+
+    # Markov override
     override_reason = None
     markov_info = compute_markov_transition(df_feat_session)
     if markov_info and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
@@ -362,6 +381,7 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
             decision = "Tài"
             override_reason = "Markov: Xác suất đảo chiều cao"
 
+    # Streak override
     if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         decision = "Xỉu" if decision == "Tài" else "Tài"
         override_reason = f"Chuỗi {('Tài' if decision == 'Xỉu' else 'Xỉu')} liên tiếp ({streak} phiên)"
@@ -369,12 +389,12 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     insert_result("BOT_PREDICT", None, decision)
 
     total, correct, wrong, acc = summary_stats(df)
-    result_msg = [f"BOT dự đoán phiên tiếp theo: {decision}"]
-    result_msg.append(f"Dải điểm nên đánh: {'11 → 17' if decision == 'Tài' else '4 → 10'}")
+    result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
+    result_msg.append(f"Stacking: {explain_msg}")
     if override_reason:
         result_msg.insert(1, f"Lý do: {override_reason}")
-    if confidence in ["Thấp", "Trung bình"]:
-        result_msg.append("⚠️ Xác suất hiện tại không cao, nên cân nhắc kỹ trước khi vào lệnh.")
+    if risk_note:
+        result_msg.append(risk_note)
     if bao:
         result_msg.append("⚡ Có thể vào bão")
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
@@ -392,7 +412,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Khởi chạy Flask keep-alive song song với Telegram polling
     threading.Thread(target=start_flask, daemon=True).start()
-
     asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
