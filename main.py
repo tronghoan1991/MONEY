@@ -51,26 +51,29 @@ def start_flask():
 
 # ==== KHỞI TẠO DATABASE ====
 def create_table():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
     try:
-        cur.execute("ALTER TABLE history ADD COLUMN input_time FLOAT;")
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        try:
+            cur.execute("ALTER TABLE history ADD COLUMN input_time FLOAT;")
+            conn.commit()
+        except psycopg2.errors.DuplicateColumn:
+            conn.rollback()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                id SERIAL PRIMARY KEY,
+                input TEXT,
+                actual TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                bot_predict TEXT,
+                input_time FLOAT DEFAULT NULL
+            );
+        """)
         conn.commit()
-    except psycopg2.errors.DuplicateColumn:
-        conn.rollback()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id SERIAL PRIMARY KEY,
-            input TEXT,
-            actual TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            bot_predict TEXT,
-            input_time FLOAT DEFAULT NULL
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("Lỗi khi tạo database:", e)
 
 # ==== XÁC ĐỊNH KHUNG GIỜ ====
 def get_time_block():
@@ -84,28 +87,35 @@ def get_time_block():
 
 # === PHẦN 2: GHI LỊCH SỬ, TẠO FEATURES, PHIÊN CHƠI ===
 def insert_result(input_str, actual, bot_predict=None, input_time=None):
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-    now = datetime.now()
-    if bot_predict is not None:
-        cur.execute("""
-            INSERT INTO history (input, actual, bot_predict, created_at, input_time)
-            VALUES (%s, %s, %s, %s, %s);
-        """, (input_str, actual, bot_predict, now, input_time))
-    else:
-        cur.execute("""
-            INSERT INTO history (input, actual, created_at, input_time)
-            VALUES (%s, %s, %s, %s);
-        """, (input_str, actual, now, input_time))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        now = datetime.now()
+        if bot_predict is not None:
+            cur.execute("""
+                INSERT INTO history (input, actual, bot_predict, created_at, input_time)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (input_str, actual, bot_predict, now, input_time))
+        else:
+            cur.execute("""
+                INSERT INTO history (input, actual, created_at, input_time)
+                VALUES (%s, %s, %s, %s);
+            """, (input_str, actual, now, input_time))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("Lỗi khi ghi lịch sử:", e)
 
 def fetch_history(limit=10000):
-    engine = create_engine(DATABASE_URL)
-    df = pd.read_sql("SELECT * FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
-    engine.dispose()
-    return df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False) | (df["input"] == "BOT_PREDICT")]
+    try:
+        engine = create_engine(DATABASE_URL)
+        df = pd.read_sql("SELECT * FROM history ORDER BY id ASC LIMIT %s" % limit, engine)
+        engine.dispose()
+        return df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False) | (df["input"] == "BOT_PREDICT")]
+    except Exception as e:
+        print("Lỗi khi lấy lịch sử:", e)
+        return pd.DataFrame()
 
 def summary_stats(df):
     df_pred = df[(df["bot_predict"].notnull()) & (df["actual"].notnull())]
@@ -116,30 +126,36 @@ def summary_stats(df):
     return total, correct, wrong, acc
 
 def save_session_start(time=None):
-    with open(SESSION_FILE, "w") as f:
-        f.write(str(time if time else datetime.now().isoformat()))
+    try:
+        with open(SESSION_FILE, "w") as f:
+            f.write(str(time if time else datetime.now().isoformat()))
+    except Exception as e:
+        print("Lỗi lưu session:", e)
 
 def load_session_start():
     if not os.path.exists(SESSION_FILE):
         return None
-    with open(SESSION_FILE, "r") as f:
-        try:
+    try:
+        with open(SESSION_FILE, "r") as f:
             return datetime.fromisoformat(f.read().strip())
-        except:
-            return None
+    except:
+        return None
 
 def save_last_play(time=None):
-    with open(LAST_PLAY_FILE, "w") as f:
-        f.write(str(time if time else datetime.now().isoformat()))
+    try:
+        with open(LAST_PLAY_FILE, "w") as f:
+            f.write(str(time if time else datetime.now().isoformat()))
+    except Exception as e:
+        print("Lỗi lưu last_play:", e)
 
 def load_last_play():
     if not os.path.exists(LAST_PLAY_FILE):
         return None
-    with open(LAST_PLAY_FILE, "r") as f:
-        try:
+    try:
+        with open(LAST_PLAY_FILE, "r") as f:
             return datetime.fromisoformat(f.read().strip())
-        except:
-            return None
+    except:
+        return None
 
 def make_features(df):
     df = df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False)].copy()
@@ -214,11 +230,38 @@ def load_models_by_timeblock():
     path = f"models_{block}.joblib"
     return joblib.load(path) if os.path.exists(path) else None
 
-# === PHẦN 4: BỔ SUNG HÀM THIẾU (SỬA LỖI) ===
+# === PHẦN 4: THUẬT TOÁN NÂNG CAO (MARKOV, STACKING, CONFIDENCE) ===
 
-def predict_stacking(X_pred, models, key):
+def compute_markov_transition(df):
+    seq = df['tai'].dropna().astype(int).tolist()
+    if len(seq) < 2:
+        return None
+    T2T = T2X = X2T = X2X = 0
+    for i in range(1, len(seq)):
+        prev, curr = seq[i-1], seq[i]
+        if prev == 1 and curr == 1:
+            T2T += 1
+        elif prev == 1 and curr == 0:
+            T2X += 1
+        elif prev == 0 and curr == 1:
+            X2T += 1
+        elif prev == 0 and curr == 0:
+            X2X += 1
+
+    t_count = sum(1 for x in seq[:-1] if x == 1)
+    x_count = sum(1 for x in seq[:-1] if x == 0)
+    last = seq[-1]
+    return {
+        'last': 'T' if last == 1 else 'X',
+        'prob_T2T': T2T / t_count if t_count else 0.5,
+        'prob_T2X': T2X / t_count if t_count else 0.5,
+        'prob_X2T': X2T / x_count if x_count else 0.5,
+        'prob_X2X': X2X / x_count if x_count else 0.5
+    }
+
+def predict_stacking(X_pred, models, key, weights=(0.33, 0.33, 0.34)):
     """
-    Trả về xác suất dự đoán stacking trung bình của 3 model (LR, RF, XGB) với nhãn key (tx, cl, bao).
+    Weighted stacking xác suất 3 model (LR, RF, XGB). Weights sum to 1.
     """
     if models is None or key not in models or models[key] is None:
         return 0.5, None
@@ -230,19 +273,18 @@ def predict_stacking(X_pred, models, key):
         except Exception:
             proba = 0.5
         probas.append(proba)
-    avg_proba = float(np.mean(probas))
+    avg_proba = float(np.dot(probas, weights))
     return avg_proba, probas
 
 def get_confidence_label(proba):
-    if proba >= 0.75 or proba <= 0.25:
+    if proba >= 0.8 or proba <= 0.2:
+        return "Rất cao"
+    elif proba >= 0.7 or proba <= 0.3:
         return "Cao"
     elif proba >= 0.6 or proba <= 0.4:
         return "Trung bình"
     else:
         return "Thấp"
-
-def compute_markov_transition(df):
-    return None
 
 # === PHẦN 5: TELEGRAM HANDLERS – NHẬP PHIÊN, RESET ===
 
@@ -313,12 +355,12 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markov_info = compute_markov_transition(df_feat_session)
     if markov_info and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         last = markov_info['last']
-        if last == "T" and decision == "Tài" and markov_info['prob_T2X'] > markov_info['prob_X2T']:
+        if last == "T" and decision == "Tài" and markov_info['prob_T2X'] > markov_info['prob_T2T']:
             decision = "Xỉu"
-            override_reason = "Markov cho thấy xác suất đảo chiều cao"
-        elif last == "X" and decision == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_T2X']:
+            override_reason = "Markov: Xác suất đảo chiều cao"
+        elif last == "X" and decision == "Xỉu" and markov_info['prob_X2T'] > markov_info['prob_X2X']:
             decision = "Tài"
-            override_reason = "Markov cho thấy xác suất đảo chiều cao"
+            override_reason = "Markov: Xác suất đảo chiều cao"
 
     if not override_reason and streak >= STREAK_THRESHOLD and abs(tx_proba - 0.5) <= (1 - OVERRIDE_CUTOFF):
         decision = "Xỉu" if decision == "Tài" else "Tài"
@@ -331,8 +373,8 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_msg.append(f"Dải điểm nên đánh: {'11 → 17' if decision == 'Tài' else '4 → 10'}")
     if override_reason:
         result_msg.insert(1, f"Lý do: {override_reason}")
-    if confidence == "Thấp":
-        result_msg.append("*Lưu ý: Xác suất hiện tại không rõ ràng, cân nhắc không vào*")
+    if confidence in ["Thấp", "Trung bình"]:
+        result_msg.append("⚠️ Xác suất hiện tại không cao, nên cân nhắc kỹ trước khi vào lệnh.")
     if bao:
         result_msg.append("⚡ Có thể vào bão")
     result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
