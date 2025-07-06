@@ -219,9 +219,20 @@ FEATURES = [
 def train_point_model(df, save_path=MODEL_PATH):
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
-    # classes = np.array(list(range(4, 18)))  # Giữ lại nếu cần nhưng không truyền vào fit
+
+    # Bổ sung các lớp còn thiếu (từ 4–17)
+    all_classes = np.arange(4, 18)
+    present_classes = np.unique(y)
+    missing_classes = [c for c in all_classes if c not in present_classes]
+    if missing_classes:
+        # Tạo dummy row (giá trị 0 cho các feature) cho từng class còn thiếu
+        X_dummy = pd.DataFrame(0, index=np.arange(len(missing_classes)), columns=FEATURES)
+        y_dummy = pd.Series(missing_classes)
+        X = pd.concat([X, X_dummy], ignore_index=True)
+        y = pd.concat([y, y_dummy], ignore_index=True)
+
     model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
-    model.fit(X, y)  # KHÔNG truyền classes vào đây
+    model.fit(X, y)
     joblib.dump(model, save_path)
     return None
 
