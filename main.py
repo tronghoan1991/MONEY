@@ -14,6 +14,7 @@ import numpy as np
 from flask import Flask
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
 
 warnings.filterwarnings('ignore')
@@ -220,28 +221,33 @@ def train_point_model(df, save_path=MODEL_PATH):
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
 
-    # Bổ sung các lớp còn thiếu (từ 4–17)
     all_classes = np.arange(4, 18)
     present_classes = np.unique(y)
     missing_classes = [c for c in all_classes if c not in present_classes]
     if missing_classes:
-        # Tạo dummy row (giá trị 0 cho các feature) cho từng class còn thiếu
         X_dummy = pd.DataFrame(0, index=np.arange(len(missing_classes)), columns=FEATURES)
         y_dummy = pd.Series(missing_classes)
         X = pd.concat([X, X_dummy], ignore_index=True)
         y = pd.concat([y, y_dummy], ignore_index=True)
 
+    le = LabelEncoder()
+    le.fit(all_classes)
+    y_encoded = le.transform(y)
     model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
-    model.fit(X, y)
-    joblib.dump(model, save_path)
+    model.fit(X, y_encoded)
+    joblib.dump({'model': model, 'label_encoder': le}, save_path)
     return None
 
 def load_point_model():
     path = MODEL_PATH
     if os.path.exists(path):
-        return joblib.load(path)
+        obj = joblib.load(path)
+        if isinstance(obj, dict) and 'model' in obj and 'label_encoder' in obj:
+            return obj['model'], obj['label_encoder']
+        else:
+            return obj, None
     else:
-        return None
+        return None, None
 
 def get_confidence_label(proba):
     if proba >= 0.8 or proba <= 0.2:
@@ -326,10 +332,10 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
 
-    model = load_point_model()
+    model, le = load_point_model()
     if model is None or (len(df_feat) % 100 == 0 and len(df_feat) > 0):
         train_point_model(df_feat)
-        model = load_point_model()
+        model, le = load_point_model()
 
     if model is None:
         await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
@@ -338,12 +344,14 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
     try:
         proba_all = model.predict_proba(X_pred)[0]
-        classes = model.classes_
+        if le:
+            classes = le.inverse_transform(np.arange(len(proba_all)))
+        else:
+            classes = model.classes_
     except Exception:
         await update.message.reply_text("⚠️ Model lỗi, cần nhập thêm phiên hoặc retrain.")
         return
     prob_dict = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
-    # Nếu thiếu tổng điểm nào thì cho xác suất = 0 (không bao giờ báo lỗi)
     for pt in range(4, 18):
         if pt not in prob_dict:
             prob_dict[pt] = 0.0
