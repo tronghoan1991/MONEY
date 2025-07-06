@@ -12,10 +12,22 @@ import time
 import warnings
 import numpy as np
 from flask import Flask
+import io
+
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
+try:
+    import lightgbm as lgb
+    has_lgb = True
+except ImportError:
+    has_lgb = False
+try:
+    from catboost import CatBoostClassifier
+    has_cat = True
+except ImportError:
+    has_cat = False
 
 warnings.filterwarnings('ignore')
 
@@ -221,17 +233,27 @@ def train_point_model(df, save_path=MODEL_PATH):
     le = LabelEncoder()
     le.fit(all_classes)
     y_encoded = le.transform(y)
-    model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
-    model.fit(X, y_encoded)
-    joblib.dump({'model': model, 'label_encoder': le}, save_path)
-    return None
+
+    models = [
+        ('xgb', xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')),
+        ('rf', RandomForestClassifier(n_estimators=100)),
+        ('lr', LogisticRegression(max_iter=500, multi_class='auto'))
+    ]
+    if has_lgb:
+        models.append(('lgb', lgb.LGBMClassifier(n_estimators=100)))
+    if has_cat:
+        models.append(('cat', CatBoostClassifier(iterations=100, verbose=0)))
+
+    ensemble = VotingClassifier(estimators=models, voting='soft', n_jobs=-1)
+    ensemble.fit(X, y_encoded)
+    joblib.dump({'ensemble': ensemble, 'label_encoder': le}, save_path)
 
 def load_point_model():
     path = MODEL_PATH
     if os.path.exists(path):
         obj = joblib.load(path)
-        if isinstance(obj, dict) and 'model' in obj and 'label_encoder' in obj:
-            return obj['model'], obj['label_encoder']
+        if isinstance(obj, dict) and 'ensemble' in obj and 'label_encoder' in obj:
+            return obj['ensemble'], obj['label_encoder']
         else:
             return obj, None
     else:
@@ -267,6 +289,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Gửi 3 số phiên gần nhất (ví dụ: `354` hoặc `4 5 3`) để nhập kết quả thực tế và nhận dự đoán phiên tiếp theo\n"
         "• /start — Hiển thị menu các lệnh (bạn đang xem)\n"
         "• /reset — Reset lại phiên chơi, bắt đầu thống kê mới\n"
+        "• /export — Xuất toàn bộ lịch sử các phiên đã lưu ra file CSV\n"
         "\n"
         "👉 **Hướng dẫn nhanh:**\n"
         "- Gửi đúng định dạng 3 số liên tiếp (vd: 345) hoặc cách nhau bởi dấu cách (vd: 3 4 5)\n"
@@ -280,6 +303,22 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if os.path.exists(SESSION_FILE):
         os.remove(SESSION_FILE)
     await update.message.reply_text("Đã reset phiên chơi!")
+
+async def export_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        engine = create_engine(DATABASE_URL)
+        df = pd.read_sql("SELECT * FROM history ORDER BY id ASC", engine)
+        engine.dispose()
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        buf.seek(0)
+        await update.message.reply_document(
+            document=buf,
+            filename="history.csv",
+            caption="📄 File lịch sử các phiên đã lưu"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Xuất file thất bại: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     input_str = update.message.text.strip()
@@ -307,7 +346,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_id = insert_result_return_id(" ".join(map(str, numbers)), actual, None, input_time)
 
     # So sánh với dự đoán của bot phiên trước đó (BOT_PREDICT chưa có actual)
-    # Tìm dòng BOT_PREDICT gần nhất mà actual is NULL
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -319,7 +357,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = cur.fetchone()
         if res:
             pred_id, bot_predict = res
-            # Cập nhật actual cho dòng BOT_PREDICT này
             cur.execute("""
                 UPDATE history SET actual=%s WHERE id=%s
             """, (actual, pred_id))
@@ -343,24 +380,21 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df_feat = make_features(df)
     df_feat_session = make_features(df_session)
 
-    model, le = load_point_model()
-    if model is None or (len(df_feat) % 100 == 0 and len(df_feat) > 0):
+    ensemble, le = load_point_model()
+    if ensemble is None or (len(df_feat) % 100 == 0 and len(df_feat) > 0):
         train_point_model(df_feat)
-        model, le = load_point_model()
+        ensemble, le = load_point_model()
 
-    if model is None:
+    if ensemble is None:
         await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
         return
 
     X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
     try:
-        proba_all = model.predict_proba(X_pred)[0]
-        if le:
-            classes = le.inverse_transform(np.arange(len(proba_all)))
-        else:
-            classes = model.classes_
-    except Exception:
-        await update.message.reply_text("⚠️ Model lỗi, cần nhập thêm phiên hoặc retrain.")
+        proba_all = ensemble.predict_proba(X_pred)[0]
+        classes = le.inverse_transform(np.arange(len(proba_all)))
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Model lỗi: {e}")
         return
     prob_dict = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
     for pt in range(4, 18):
@@ -393,15 +427,14 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_result_return_id("BOT_PREDICT", None, decision)
 
-    # Thống kê chuẩn: phiên nhập, phiên dự đoán, số đã kiểm tra, đúng/sai/%
     total_input, total_pred, total_eval, correct, wrong, acc = summary_stats(df)
     result_msg = [
         f"Tổng phiên nhập: {total_input}",
         f"Tổng phiên dự đoán: {total_pred}",
-        f"Đã kiểm tra/chấm kết quả: {total_eval} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%"
+        f"Đã kiểm tra/chấm kết quả: {total_eval} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%",
+        f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)",
+        range_text
     ]
-    result_msg.append(f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)")
-    result_msg.append(range_text)
     if risk_note:
         result_msg.append(risk_note)
     if bao:
@@ -415,6 +448,7 @@ if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("export", export_history))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     threading.Thread(target=start_flask, daemon=True).start()
     asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
