@@ -219,12 +219,11 @@ FEATURES = [
 def train_point_model(df, save_path=MODEL_PATH):
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
-    classes = np.array(list(range(4, 18)))  # Luôn ép đủ 4-17
+    # classes = np.array(list(range(4, 18)))  # Giữ lại nếu cần nhưng không truyền vào fit
     model = xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')
-    model.fit(X, y, classes=classes)
+    model.fit(X, y)  # KHÔNG truyền classes vào đây
     joblib.dump(model, save_path)
     return None
-
 
 def load_point_model():
     path = MODEL_PATH
