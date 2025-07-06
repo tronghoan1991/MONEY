@@ -1,8 +1,11 @@
-pandas
-psycopg2
-SQLAlchemy
-python-telegram-bot==20.0
-scikit-learn
 xgboost
-joblib
+scikit-learn
+pandas
+sqlalchemy
+lightgbm
+catboost
+psycopg2-binary
+python-telegram-bot==20.7
 flask
+joblib
+numpy
