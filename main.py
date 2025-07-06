@@ -101,23 +101,6 @@ def insert_result_return_id(input_str, actual, bot_predict=None, input_time=None
         print("Lỗi khi ghi lịch sử:", e)
     return result_id
 
-def update_prev_bot_predict_actual(actual_value, id_current):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE history
-            SET actual = %s
-            WHERE input = 'BOT_PREDICT' AND id < %s AND actual IS NULL
-            ORDER BY id DESC
-            LIMIT 1
-        """, (actual_value, id_current))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print("Lỗi cập nhật actual cho BOT_PREDICT:", e)
-
 def fetch_history(limit=TRAIN_LIMIT):
     try:
         engine = create_engine(DATABASE_URL)
@@ -130,12 +113,17 @@ def fetch_history(limit=TRAIN_LIMIT):
         return pd.DataFrame()
 
 def summary_stats(df):
-    df_pred = df[df["input"] == "BOT_PREDICT"]
+    # Đếm số phiên nhập thực tế
+    total_input = len(df[df["input"] != "BOT_PREDICT"])
+    # Tổng số phiên dự đoán
+    total_pred = len(df[df["input"] == "BOT_PREDICT"])
+    # Chỉ tính những phiên BOT_PREDICT đã được chấm kết quả (actual không null)
+    df_pred = df[(df["input"] == "BOT_PREDICT") & (df["actual"].notnull())]
+    total_eval = len(df_pred)
     correct = (df_pred["bot_predict"] == df_pred["actual"]).sum()
-    total = len(df_pred)
-    wrong = total - correct
-    acc = round((correct / total) * 100, 2) if total else 0
-    return total, correct, wrong, acc
+    wrong = total_eval - correct
+    acc = round((correct / total_eval) * 100, 2) if total_eval else 0
+    return total_input, total_pred, total_eval, correct, wrong, acc
 
 def save_session_start(time=None):
     try:
@@ -315,9 +303,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_session_start(now)
     save_last_play(now)
 
+    # Lưu kết quả thực tế
     result_id = insert_result_return_id(" ".join(map(str, numbers)), actual, None, input_time)
-    if result_id is not None:
-        update_prev_bot_predict_actual(actual, result_id)
+
+    # So sánh với dự đoán của bot phiên trước đó (BOT_PREDICT chưa có actual)
+    # Tìm dòng BOT_PREDICT gần nhất mà actual is NULL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, bot_predict FROM history
+            WHERE input = 'BOT_PREDICT' AND actual IS NULL
+            ORDER BY id DESC LIMIT 1
+        """)
+        res = cur.fetchone()
+        if res:
+            pred_id, bot_predict = res
+            # Cập nhật actual cho dòng BOT_PREDICT này
+            cur.execute("""
+                UPDATE history SET actual=%s WHERE id=%s
+            """, (actual, pred_id))
+            conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("Lỗi cập nhật actual cho BOT_PREDICT:", e)
+
     await predict(update, context)
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,14 +393,19 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     insert_result_return_id("BOT_PREDICT", None, decision)
 
-    total, correct, wrong, acc = summary_stats(df)
-    result_msg = [f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)"]
+    # Thống kê chuẩn: phiên nhập, phiên dự đoán, số đã kiểm tra, đúng/sai/%
+    total_input, total_pred, total_eval, correct, wrong, acc = summary_stats(df)
+    result_msg = [
+        f"Tổng phiên nhập: {total_input}",
+        f"Tổng phiên dự đoán: {total_pred}",
+        f"Đã kiểm tra/chấm kết quả: {total_eval} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%"
+    ]
+    result_msg.append(f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)")
     result_msg.append(range_text)
     if risk_note:
         result_msg.append(risk_note)
     if bao:
         result_msg.append("⚡ Có thể vào bão")
-    result_msg.append(f"Tổng phiên dự đoán: {total} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%")
 
     await update.message.reply_text("\n".join(result_msg))
 
