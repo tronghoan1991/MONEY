@@ -218,6 +218,9 @@ FEATURES = [
 ]
 
 def train_point_model(df, save_path=MODEL_PATH):
+    
+    # Loại bỏ các total ngoài khoảng 4-17 để tránh nhãn không hợp lệ
+    df = df[df['total'].between(4,17)]
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
 
