@@ -218,9 +218,6 @@ FEATURES = [
 ]
 
 def train_point_model(df, save_path=MODEL_PATH):
-    
-    # Loại bỏ các total ngoài khoảng 4-17 để tránh nhãn không hợp lệ
-    df = df[df['total'].between(4,17)]
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
 
@@ -407,6 +404,24 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prob_tai = sum([prob_dict.get(pt, 0) for pt in range(11, 18)])
     prob_xiu = sum([prob_dict.get(pt, 0) for pt in range(4, 11)])
 
+
+    # ==== Kiểm tra điều kiện thực chiến: cầu nhiễu và độ chính xác thấp ====
+    recent_inputs = df_session[df_session['input'] != "BOT_PREDICT"].tail(6)
+    last_tx = ["Tài" if sum(map(int, x.split())) >= 11 else "Xỉu" for x in recent_inputs['input']]
+    flip_count = sum(1 for i in range(1, len(last_tx)) if last_tx[i] != last_tx[i-1])
+
+    # Thống kê độ chính xác phiên hiện tại
+    df_pred_session = df_session[(df_session["input"] == "BOT_PREDICT") & (df_session["actual"].notnull())]
+    total_eval = len(df_pred_session)
+    correct = (df_pred_session["bot_predict"] == df_pred_session["actual"]).sum()
+    acc = round((correct / total_eval) * 100, 2) if total_eval else 0
+
+    if flip_count >= 3 and acc < 60:
+        await update.message.reply_text(
+            f"⚠️ Cầu đang nhiễu (đổi {flip_count} lần trong 6 phiên) và độ chính xác hiện tại thấp ({acc}%).\n"
+            "📌 Khuyến nghị: Nghỉ 1 phiên, chờ thêm dữ liệu rõ hơn."
+        )
+        return
     if prob_tai >= prob_xiu:
         decision = "Tài"
         tx_proba = prob_tai
