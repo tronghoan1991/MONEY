@@ -4,6 +4,6 @@ uvicorn
 pandas
 psycopg2-binary
 sqlalchemy
-xgboost
+xgboost==1.7.6
 scikit-learn
 joblib
