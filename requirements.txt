@@ -1,11 +1,9 @@
+python-telegram-bot==20.7
+fastapi
+uvicorn
+pandas
+psycopg2-binary
+sqlalchemy
 xgboost
 scikit-learn
-pandas
-sqlalchemy
-lightgbm
-catboost
-psycopg2-binary
-python-telegram-bot==20.7
-flask
 joblib
-numpy
