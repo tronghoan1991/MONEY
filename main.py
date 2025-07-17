@@ -7,10 +7,9 @@ from sqlalchemy import create_engine
 from fastapi import FastAPI, Request
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
 from datetime import datetime
-import threading
 import joblib
 import re
 import numpy as np
@@ -22,13 +21,12 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ==== SETUP LOGGER ====
+# ==== LOGGER ====
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
-
 logger.info(f"Starting bot with Python version: {sys.version}")
 
 # ==== CONFIG ====
@@ -325,7 +323,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 df_feat = make_features(df)
                 if not os.path.exists(MODEL_PATH) or len(df_feat) % 50 == 0:
                     train_point_model(df_feat)
-                ensemble, le = load_point_model()
+                ensemble, le = joblib.load(MODEL_PATH).values()
                 X_pred = make_features(df.tail(ROLLING_WINDOW)).iloc[[-1]][FEATURES].fillna(0)
                 proba1 = None
                 if ensemble is not None:
@@ -390,12 +388,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== FASTAPI WEBHOOK ====
 app = FastAPI()
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+telegram_app = None
 
 @app.on_event("startup")
 async def on_startup():
+    global telegram_app
     logger.info("App starting up, creating DB table & setting webhook.")
     create_table()
+    telegram_app = await ApplicationBuilder().token(BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("batdau", start_prediction))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
         webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook/{BOT_TOKEN}"
@@ -404,11 +406,9 @@ async def on_startup():
 
 @app.post(f"/webhook/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
+    global telegram_app
     data = await request.json()
     logger.info(f"Received update: {data}")
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
-
-telegram_app.add_handler(CommandHandler("batdau", start_prediction))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
