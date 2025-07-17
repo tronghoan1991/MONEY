@@ -2,184 +2,95 @@ import os
 import pandas as pd
 import psycopg2
 from sqlalchemy import create_engine
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from fastapi import FastAPI, Request
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from telegram.ext._webhookhandler import WebhookServer
 from datetime import datetime
-import re
-import joblib
 import threading
-import time
-import warnings
+import joblib
+import re
 import numpy as np
-from flask import Flask
-import io
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
-try:
-    import lightgbm as lgb
-    has_lgb = True
-except ImportError:
-    has_lgb = False
-try:
-    from catboost import CatBoostClassifier
-    has_cat = True
-except ImportError:
-    has_cat = False
+import warnings
 
 warnings.filterwarnings('ignore')
 
+# ==== CONFIG ====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 ROLLING_WINDOW = 12
 MODEL_PATH = "ml_stack_point.joblib"
-SESSION_FILE = "session_time.txt"
-LAST_PLAY_FILE = "last_play_time.txt"
-
 MIN_SESSION_INPUT = 10
-SESSION_BREAK_MINUTES = 30
+POINTS = list(range(3, 19))
+ALPHA = 0.5
 
-POINTS = list(range(4, 18))  # tổng điểm từ 4 tới 17
-TRAIN_LIMIT = 2000           # rolling window phù hợp RAM free server
-
-def start_flask():
-    app = Flask(__name__)
-
-    @app.route("/")
-    def home():
-        return "Bot is alive!", 200
-
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
+# ==== DB ====
 def create_table():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        try:
-            cur.execute("ALTER TABLE history ADD COLUMN input_time FLOAT;")
-            conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id SERIAL PRIMARY KEY,
-                input TEXT,
-                actual TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                bot_predict TEXT,
-                input_time FLOAT DEFAULT NULL
+                user_id BIGINT,
+                guess_type TEXT,
+                guess_points TEXT,
+                input_result TEXT,
+                input_total INT,
+                is_bao INT,
+                is_correct INT,
+                ml_pred_type TEXT,
+                ml_pred_points TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
             );
         """)
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        print("Lỗi khi tạo database:", e)
+        print("DB Error:", e)
 
-def get_time_block():
-    hour = datetime.now().hour
-    if 5 <= hour <= 11:
-        return 'sang'
-    elif 12 <= hour <= 17:
-        return 'chieu'
-    else:
-        return 'toi'
-
-def insert_result_return_id(input_str, actual, bot_predict=None, input_time=None):
-    result_id = None
+def save_prediction(user_id, guess_type, guess_points, input_result, input_total, is_bao, is_correct, ml_pred_type, ml_pred_points):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-        now = datetime.now()
-        if bot_predict is not None:
-            cur.execute("""
-                INSERT INTO history (input, actual, bot_predict, created_at, input_time)
-                VALUES (%s, %s, %s, %s, %s) RETURNING id;
-            """, (input_str, actual, bot_predict, now, input_time))
-        else:
-            cur.execute("""
-                INSERT INTO history (input, actual, created_at, input_time)
-                VALUES (%s, %s, %s, %s) RETURNING id;
-            """, (input_str, actual, now, input_time))
-        result_id = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO history (user_id, guess_type, guess_points, input_result, input_total, is_bao, is_correct, ml_pred_type, ml_pred_points)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, (user_id, guess_type, guess_points, input_result, input_total, is_bao, is_correct, ml_pred_type, ml_pred_points))
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        print("Lỗi khi ghi lịch sử:", e)
-    return result_id
+        print("DB Save Error:", e)
 
-def fetch_history(limit=TRAIN_LIMIT):
+def fetch_history(limit=1000):
     try:
         engine = create_engine(DATABASE_URL)
         df = pd.read_sql("SELECT * FROM history ORDER BY id DESC LIMIT %s" % limit, engine)
         engine.dispose()
-        df = df.sort_values('id')  # đảm bảo đúng thứ tự thời gian
-        return df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False) | (df["input"] == "BOT_PREDICT")]
+        df = df.sort_values('id')
+        return df
     except Exception as e:
-        print("Lỗi khi lấy lịch sử:", e)
+        print("DB Fetch Error:", e)
         return pd.DataFrame()
 
-def summary_stats(df):
-    # Đếm số phiên nhập thực tế
-    total_input = len(df[df["input"] != "BOT_PREDICT"])
-    # Tổng số phiên dự đoán
-    total_pred = len(df[df["input"] == "BOT_PREDICT"])
-    # Chỉ tính những phiên BOT_PREDICT đã được chấm kết quả (actual không null)
-    df_pred = df[(df["input"] == "BOT_PREDICT") & (df["actual"].notnull())]
-    total_eval = len(df_pred)
-    correct = (df_pred["bot_predict"] == df_pred["actual"]).sum()
-    wrong = total_eval - correct
-    acc = round((correct / total_eval) * 100, 2) if total_eval else 0
-    return total_input, total_pred, total_eval, correct, wrong, acc
-
-def save_session_start(time=None):
-    try:
-        with open(SESSION_FILE, "w") as f:
-            f.write(str(time if time else datetime.now().isoformat()))
-    except Exception as e:
-        print("Lỗi lưu session:", e)
-
-def load_session_start():
-    if not os.path.exists(SESSION_FILE):
-        return None
-    try:
-        with open(SESSION_FILE, "r") as f:
-            return datetime.fromisoformat(f.read().strip())
-    except:
-        return None
-
-def save_last_play(time=None):
-    try:
-        with open(LAST_PLAY_FILE, "w") as f:
-            f.write(str(time if time else datetime.now().isoformat()))
-    except Exception as e:
-        print("Lỗi lưu last_play:", e)
-
-def load_last_play():
-    if not os.path.exists(LAST_PLAY_FILE):
-        return None
-    try:
-        with open(LAST_PLAY_FILE, "r") as f:
-            return datetime.fromisoformat(f.read().strip())
-    except:
-        return None
-
+# ==== ML + FEATURES ====
 def make_features(df):
-    df = df[df["input"].str.match(r"^\d+$|^\d+\s+\d+\s+\d+$", na=False)].copy()
+    df = df.copy()
     def extract_numbers(x):
-        x = str(x)
-        if " " in x:
+        if isinstance(x, str) and re.match(r"^\d+\s+\d+\s+\d+$", x):
             return list(map(int, x.split()))
-        elif len(x) == 3 and x.isdigit():
+        elif isinstance(x, str) and len(x) == 3 and x.isdigit():
             return [int(x[0]), int(x[1]), int(x[2])]
         return [0, 0, 0]
-
-    df[["n1", "n2", "n3"]] = df["input"].apply(lambda x: pd.Series(extract_numbers(x)))
+    df[["n1", "n2", "n3"]] = df["input_result"].apply(lambda x: pd.Series(extract_numbers(x)))
     df["total"] = df[["n1", "n2", "n3"]].sum(axis=1)
     df["even"] = df["total"] % 2
     df["bao"] = df.apply(lambda row: 1 if row["n1"] == row["n2"] == row["n3"] else 0, axis=1)
@@ -187,14 +98,11 @@ def make_features(df):
     df["xiu"] = (df["total"] <= 10).astype(int)
     df["chan"] = (df["even"] == 0).astype(int)
     df["le"] = (df["even"] == 1).astype(int)
-
     for col in ["tai", "xiu", "chan", "le", "bao"]:
         df[f"{col}_roll"] = df[col].rolling(ROLLING_WINDOW, min_periods=1).mean()
-
     for i in range(1, 4):
         df[f"tai_lag_{i}"] = df["tai"].shift(i)
         df[f"chan_lag_{i}"] = df["chan"].shift(i)
-
     def get_streak(arr):
         streaks = [1]
         for i in range(1, len(arr)):
@@ -203,10 +111,21 @@ def make_features(df):
             else:
                 streaks.append(1)
         return streaks
-
     df["tai_streak"] = get_streak(df["tai"].tolist())
     df["chan_streak"] = get_streak(df["chan"].tolist())
     return df
+
+def make_user_behavior_features(df):
+    df = df.copy()
+    df["guess_tai"] = (df["guess_type"] == "Tài").astype(int)
+    df["guess_xiu"] = (df["guess_type"] == "Xỉu").astype(int)
+    df["guess_bao"] = (df["guess_type"] == "Bão").astype(int)
+    for pt in range(3, 19):
+        df[f"guess_point_{pt}"] = df["guess_points"].apply(lambda x: str(pt) in str(x).split(","))
+    return df[
+        ["guess_tai", "guess_xiu", "guess_bao"] +
+        [f"guess_point_{pt}" for pt in range(3, 19)]
+    ].astype(int)
 
 FEATURES = [
     'n1', 'n2', 'n3', 'total', 'even', 'bao',
@@ -220,8 +139,7 @@ FEATURES = [
 def train_point_model(df, save_path=MODEL_PATH):
     X = df[FEATURES].fillna(0)
     y = df['total'].astype(int)
-
-    all_classes = np.arange(4, 18)
+    all_classes = np.arange(3, 19)
     present_classes = np.unique(y)
     missing_classes = [c for c in all_classes if c not in present_classes]
     if missing_classes:
@@ -229,45 +147,42 @@ def train_point_model(df, save_path=MODEL_PATH):
         y_dummy = pd.Series(missing_classes)
         X = pd.concat([X, X_dummy], ignore_index=True)
         y = pd.concat([y, y_dummy], ignore_index=True)
-
     le = LabelEncoder()
     le.fit(all_classes)
     y_encoded = le.transform(y)
-
     models = [
-        ('xgb', xgb.XGBClassifier(n_estimators=100, use_label_encoder=False, eval_metric='mlogloss')),
-        ('rf', RandomForestClassifier(n_estimators=100)),
-        ('lr', LogisticRegression(max_iter=500, multi_class='auto'))
+        ('xgb', xgb.XGBClassifier(n_estimators=60, use_label_encoder=False, eval_metric='mlogloss')),
+        ('rf', RandomForestClassifier(n_estimators=60)),
+        ('lr', LogisticRegression(max_iter=300, multi_class='auto'))
     ]
-    if has_lgb:
-        models.append(('lgb', lgb.LGBMClassifier(n_estimators=100)))
-    if has_cat:
-        models.append(('cat', CatBoostClassifier(iterations=100, verbose=0)))
-
     ensemble = VotingClassifier(estimators=models, voting='soft', n_jobs=-1)
     ensemble.fit(X, y_encoded)
     joblib.dump({'ensemble': ensemble, 'label_encoder': le}, save_path)
 
+def train_behavior_model(df):
+    X = make_user_behavior_features(df)
+    y = df['input_total'].astype(int)
+    all_classes = np.arange(3, 19)
+    le = LabelEncoder()
+    le.fit(all_classes)
+    y_encoded = le.transform(y)
+    models = [
+        ('rf', RandomForestClassifier(n_estimators=40)),
+        ('lr', LogisticRegression(max_iter=200, multi_class='auto'))
+    ]
+    ensemble = VotingClassifier(estimators=models, voting='soft', n_jobs=-1)
+    ensemble.fit(X, y_encoded)
+    return ensemble, le
+
 def load_point_model():
-    path = MODEL_PATH
-    if os.path.exists(path):
-        obj = joblib.load(path)
+    if os.path.exists(MODEL_PATH):
+        obj = joblib.load(MODEL_PATH)
         if isinstance(obj, dict) and 'ensemble' in obj and 'label_encoder' in obj:
             return obj['ensemble'], obj['label_encoder']
         else:
             return obj, None
     else:
         return None, None
-
-def get_confidence_label(proba):
-    if proba >= 0.8 or proba <= 0.2:
-        return "Rất cao"
-    elif proba >= 0.7 or proba <= 0.3:
-        return "Cao"
-    elif proba >= 0.6 or proba <= 0.4:
-        return "Trung bình"
-    else:
-        return "Thấp"
 
 def suggest_best_range_point(pred_prob_dict, from_num, to_num, length=3):
     best_range = (from_num, from_num+length-1)
@@ -281,192 +196,184 @@ def suggest_best_range_point(pred_prob_dict, from_num, to_num, length=3):
             best_range = (keys[i], keys[i+length-1])
     return best_range
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    menu_text = (
-        "🎲 **BOT DỰ ĐOÁN SICBO - MENU LỆNH** 🎲\n"
-        "\n"
-        "Các lệnh & chức năng sẵn có:\n"
-        "• Gửi 3 số phiên gần nhất (ví dụ: `354` hoặc `4 5 3`) để nhập kết quả thực tế và nhận dự đoán phiên tiếp theo\n"
-        "• /start — Hiển thị menu các lệnh (bạn đang xem)\n"
-        "• /reset — Reset lại phiên chơi, bắt đầu thống kê mới\n"
-        "• /export — Xuất toàn bộ lịch sử các phiên đã lưu ra file CSV\n"
-        "\n"
-        "👉 **Hướng dẫn nhanh:**\n"
-        "- Gửi đúng định dạng 3 số liên tiếp (vd: 345) hoặc cách nhau bởi dấu cách (vd: 3 4 5)\n"
-        "- BOT sẽ lưu kết quả, tự động thống kê & dự đoán phiên kế tiếp.\n"
-        "\n"
-        "Chúc bạn may mắn và quản lý vốn thông minh! 🚦"
-    )
-    await update.message.reply_text(menu_text, parse_mode="Markdown")
+# ==== BOT FLOW ====
+user_state = {}
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if os.path.exists(SESSION_FILE):
-        os.remove(SESSION_FILE)
-    await update.message.reply_text("Đã reset phiên chơi!")
-
-async def export_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        engine = create_engine(DATABASE_URL)
-        df = pd.read_sql("SELECT * FROM history ORDER BY id ASC", engine)
-        engine.dispose()
-        buf = io.StringIO()
-        df.to_csv(buf, index=False)
-        buf.seek(0)
-        await update.message.reply_document(
-            document=buf,
-            filename="history.csv",
-            caption="📄 File lịch sử các phiên đã lưu"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Xuất file thất bại: {e}")
+async def start_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_state[user_id] = {'step': 'choose_type'}
+    keyboard = [["Tài", "Xỉu", "Bão"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text("Chọn cửa dự đoán:", reply_markup=reply_markup)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    input_str = update.message.text.strip()
-    if re.match(r"^\d{3}$", input_str):
-        numbers = [int(x) for x in input_str]
-    elif re.match(r"^\d+\s+\d+\s+\d+$", input_str):
-        numbers = list(map(int, input_str.split()))
-    else:
-        await update.message.reply_text("❌ Vui lòng nhập đúng định dạng: 3 chữ số liền nhau (VD: 354)")
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    state = user_state.get(user_id, {})
+
+    # Bước 1: Chọn cửa
+    if state.get('step') == 'choose_type':
+        if text not in ["Tài", "Xỉu", "Bão"]:
+            await update.message.reply_text("Vui lòng chọn 'Tài', 'Xỉu' hoặc 'Bão'.")
+            return
+        user_state[user_id]['guess_type'] = text
+        user_state[user_id]['guess_points'] = set()
+        user_state[user_id]['step'] = 'choose_points'
+        keyboard = [
+            [str(i) for i in range(3, 7)],
+            [str(i) for i in range(7, 11)],
+            [str(i) for i in range(11, 15)],
+            [str(i) for i in range(15, 19)],
+            ["Xác nhận", "Bỏ qua"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True)
+        await update.message.reply_text("Chọn từng điểm dự đoán (bấm từng số, xong thì chọn 'Xác nhận'):", reply_markup=reply_markup)
         return
 
-    total = sum(numbers)
-    actual = "Tài" if total >= 11 else "Xỉu"
+    # Bước 2: Multi-select điểm
+    if state.get('step') == 'choose_points':
+        if text == "Xác nhận":
+            user_state[user_id]['step'] = 'input_result'
+            points = sorted(user_state[user_id]['guess_points'])
+            if points:
+                await update.message.reply_text(
+                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} các điểm {points}\nNhập kết quả thực tế (vd: 2 4 5):"
+                )
+            else:
+                await update.message.reply_text(
+                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5):"
+                )
+            return
+        elif text == "Bỏ qua":
+            user_state[user_id]['guess_points'] = set()
+            user_state[user_id]['step'] = 'input_result'
+            await update.message.reply_text(
+                f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5):"
+            )
+            return
+        elif text.isdigit() and 3 <= int(text) <= 18:
+            point = int(text)
+            if point in user_state[user_id]['guess_points']:
+                user_state[user_id]['guess_points'].remove(point)
+                await update.message.reply_text(f"Bỏ chọn điểm {point}. Các điểm đã chọn: {sorted(user_state[user_id]['guess_points'])}")
+            else:
+                user_state[user_id]['guess_points'].add(point)
+                await update.message.reply_text(f"Đã chọn thêm điểm {point}. Các điểm đã chọn: {sorted(user_state[user_id]['guess_points'])}")
+            return
+        else:
+            await update.message.reply_text("Hãy bấm số điểm muốn chọn hoặc 'Xác nhận'.")
+            return
 
-    now = datetime.now()
-    input_time = time.time()
-    last_play = load_last_play()
-    if last_play:
-        delta = (now - last_play).total_seconds()
-        if delta > SESSION_BREAK_MINUTES * 60:
-            save_session_start(now)
-    save_last_play(now)
+    # Bước 3: Nhập kết quả thực tế
+    if state.get('step') == 'input_result':
+        nums = [int(x) for x in text.split() if x.isdigit()]
+        if len(nums) != 3 or not all(1 <= x <= 6 for x in nums):
+            await update.message.reply_text("Vui lòng nhập đúng 3 số từ 1 đến 6 (vd: 2 4 5).")
+            return
+        total = sum(nums)
+        guess_type = user_state[user_id]['guess_type']
+        guess_points = user_state[user_id]['guess_points']
+        is_bao = int(nums[0] == nums[1] == nums[2])
+        correct = False
+        # Đúng/sai với dự đoán của user
+        if guess_type == "Bão":
+            correct = is_bao
+        elif guess_points:
+            correct = total in guess_points
+        else:
+            if guess_type == "Tài":
+                correct = 11 <= total <= 18
+            elif guess_type == "Xỉu":
+                correct = 3 <= total <= 10
 
-    # Lưu kết quả thực tế
-    result_id = insert_result_return_id(" ".join(map(str, numbers)), actual, None, input_time)
+        kq_text = f"Kết quả: {nums[0]} {nums[1]} {nums[2]} (Tổng {total})"
 
-    # So sánh với dự đoán của bot phiên trước đó (BOT_PREDICT chưa có actual)
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, bot_predict FROM history
-            WHERE input = 'BOT_PREDICT' AND actual IS NULL
-            ORDER BY id DESC LIMIT 1
-        """)
-        res = cur.fetchone()
-        if res:
-            pred_id, bot_predict = res
-            cur.execute("""
-                UPDATE history SET actual=%s WHERE id=%s
-            """, (actual, pred_id))
-            conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print("Lỗi cập nhật actual cho BOT_PREDICT:", e)
+        # ===== ML KẾT HỢP 2 NGUỒN =====
+        df = fetch_history(limit=1000)
+        ml_pred_type, ml_pred_points = "-", "-"
+        if len(df) >= MIN_SESSION_INPUT:
+            df_feat = make_features(df)
+            if not os.path.exists(MODEL_PATH) or len(df_feat) % 50 == 0:
+                train_point_model(df_feat)
+            ensemble, le = load_point_model()
+            X_pred = make_features(df.tail(ROLLING_WINDOW)).iloc[[-1]][FEATURES].fillna(0)
+            proba1 = None
+            if ensemble is not None:
+                proba_all = ensemble.predict_proba(X_pred)[0]
+                classes = le.inverse_transform(np.arange(len(proba_all)))
+                prob_dict_1 = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
+                for pt in POINTS:
+                    if pt not in prob_dict_1:
+                        prob_dict_1[pt] = 0.0
+                proba1 = prob_dict_1
+            try:
+                behavior_model, behavior_le = train_behavior_model(df)
+                X_user = make_user_behavior_features(df.tail(1))
+                proba_all2 = behavior_model.predict_proba(X_user)[0]
+                classes2 = behavior_le.inverse_transform(np.arange(len(proba_all2)))
+                prob_dict_2 = {int(cls): float(prob) for cls, prob in zip(classes2, proba_all2)}
+                for pt in POINTS:
+                    if pt not in prob_dict_2:
+                        prob_dict_2[pt] = 0.0
+                proba2 = prob_dict_2
+            except Exception as e:
+                proba2 = {pt: 0.0 for pt in POINTS}
+            final_prob = {pt: ALPHA * proba1.get(pt, 0) + (1 - ALPHA) * proba2.get(pt, 0) for pt in POINTS}
+            prob_tai = sum([final_prob.get(pt, 0) for pt in range(11, 19)])
+            prob_xiu = sum([final_prob.get(pt, 0) for pt in range(3, 11)])
+            ml_pred_type = "Tài" if prob_tai > prob_xiu else "Xỉu"
+            g_range = suggest_best_range_point(final_prob, 3, 18, length=3)
+            ml_pred_points = f"{g_range[0]}-{g_range[1]}"
+            await update.message.reply_text(
+                f"🤖 BOT (cá nhân hóa + dữ liệu thực tế) dự đoán phiên tiếp:\n• Cửa: {ml_pred_type}\n• Dải điểm: {ml_pred_points}"
+            )
+        else:
+            await update.message.reply_text("BOT cần tối thiểu 10 phiên để dự đoán ML.")
 
-    await predict(update, context)
-
-async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = fetch_history()
-    session_start = load_session_start()
-    df_session = df[df['created_at'] >= session_start] if session_start else df
-
-    if len(df_session[df_session['input'] != "BOT_PREDICT"]) < MIN_SESSION_INPUT:
-        await update.message.reply_text(f"⚠️ Cần tối thiểu {MIN_SESSION_INPUT} phiên để dự đoán.")
-        return
-
-    df_feat = make_features(df)
-    df_feat_session = make_features(df_session)
-
-    ensemble, le = load_point_model()
-    if ensemble is None or (len(df_feat) % 100 == 0 and len(df_feat) > 0):
-        train_point_model(df_feat)
-        ensemble, le = load_point_model()
-
-    if ensemble is None:
-        await update.message.reply_text("⚠️ Model chưa đủ dữ liệu huấn luyện, vui lòng nhập thêm phiên.")
-        return
-
-    X_pred = df_feat_session.iloc[[-1]][FEATURES].fillna(0)
-    try:
-        proba_all = ensemble.predict_proba(X_pred)[0]
-        classes = le.inverse_transform(np.arange(len(proba_all)))
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Model lỗi: {e}")
-        return
-    prob_dict = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
-    for pt in range(4, 18):
-        if pt not in prob_dict:
-            prob_dict[pt] = 0.0
-
-    prob_tai = sum([prob_dict.get(pt, 0) for pt in range(11, 18)])
-    prob_xiu = sum([prob_dict.get(pt, 0) for pt in range(4, 11)])
-
-
-    # ==== Kiểm tra điều kiện thực chiến: cầu nhiễu và độ chính xác thấp ====
-    recent_inputs = df_session[df_session['input'] != "BOT_PREDICT"].tail(6)
-    last_tx = ["Tài" if sum(map(int, x.split())) >= 11 else "Xỉu" for x in recent_inputs['input']]
-    flip_count = sum(1 for i in range(1, len(last_tx)) if last_tx[i] != last_tx[i-1])
-
-    # Thống kê độ chính xác phiên hiện tại
-    df_pred_session = df_session[(df_session["input"] == "BOT_PREDICT") & (df_session["actual"].notnull())]
-    total_eval = len(df_pred_session)
-    correct = (df_pred_session["bot_predict"] == df_pred_session["actual"]).sum()
-    acc = round((correct / total_eval) * 100, 2) if total_eval else 0
-
-    if flip_count >= 3 and acc < 60:
-        await update.message.reply_text(
-            f"⚠️ Cầu đang nhiễu (đổi {flip_count} lần trong 6 phiên) và độ chính xác hiện tại thấp ({acc}%).\n"
-            "📌 Khuyến nghị: Nghỉ 1 phiên, chờ thêm dữ liệu rõ hơn."
+        save_prediction(
+            user_id=user_id,
+            guess_type=guess_type,
+            guess_points=",".join(str(p) for p in sorted(guess_points)) if guess_points else "",
+            input_result=" ".join(str(x) for x in nums),
+            input_total=total,
+            is_bao=is_bao,
+            is_correct=int(correct),
+            ml_pred_type=ml_pred_type,
+            ml_pred_points=ml_pred_points
         )
+
+        if correct:
+            await update.message.reply_text(f"✅ Đúng! {kq_text}")
+        else:
+            await update.message.reply_text(f"❌ Sai! {kq_text}")
+
+        user_state[user_id] = {'step': 'choose_type'}
+        keyboard = [["Tài", "Xỉu", "Bão"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text("Bạn muốn nhập dự đoán tiếp cho phiên mới? Chọn cửa dự đoán:", reply_markup=reply_markup)
         return
-    if prob_tai >= prob_xiu:
-        decision = "Tài"
-        tx_proba = prob_tai
-        g_range = suggest_best_range_point(prob_dict, 11, 17, length=3)
-        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
-    else:
-        decision = "Xỉu"
-        tx_proba = prob_xiu
-        g_range = suggest_best_range_point(prob_dict, 4, 10, length=3)
-        range_text = f"Nên đánh dải: {g_range[0]} – {g_range[1]}"
 
-    confidence = get_confidence_label(tx_proba)
-    risk_note = ""
-    if abs(tx_proba-0.5) < 0.1:
-        risk_note = "⚠️ Xác suất quá thấp, không nên vào lệnh."
-    elif abs(tx_proba-0.5) < 0.2:
-        risk_note = "⚠️ Xác suất thấp, cân nhắc kỹ."
+    await update.message.reply_text("Nhấn /batdau để bắt đầu dự đoán phiên mới.")
 
-    bao = int(X_pred["bao_roll"].values[0] > 0.2)
-    streak = int(X_pred["tai_streak"].values[0])
+# ==== FASTAPI WEBHOOK ====
+app = FastAPI()
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-    insert_result_return_id("BOT_PREDICT", None, decision)
-
-    total_input, total_pred, total_eval, correct, wrong, acc = summary_stats(df)
-    result_msg = [
-        f"Tổng phiên nhập: {total_input}",
-        f"Tổng phiên dự đoán: {total_pred}",
-        f"Đã kiểm tra/chấm kết quả: {total_eval} | Đúng: {correct} | Sai: {wrong} | Chính xác: {acc}%",
-        f"BOT dự đoán phiên tiếp theo: {decision} (xác suất {tx_proba*100:.1f}%)",
-        range_text
-    ]
-    if risk_note:
-        result_msg.append(risk_note)
-    if bao:
-        result_msg.append("⚡ Có thể vào bão")
-
-    await update.message.reply_text("\n".join(result_msg))
-
-if __name__ == "__main__":
-    import asyncio
+@app.on_event("startup")
+async def on_startup():
     create_table()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("export", export_history))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    threading.Thread(target=start_flask, daemon=True).start()
-    asyncio.run(app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False, stop_signals=None))
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        # Tự động lấy từ Render service (tùy cấu hình)
+        webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook/{BOT_TOKEN}"
+    await telegram_app.bot.set_webhook(url=webhook_url)
+
+@app.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
+
+telegram_app.add_handler(CommandHandler("batdau", start_prediction))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
