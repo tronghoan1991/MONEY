@@ -22,6 +22,14 @@ MIN_SESSION_INPUT = 10
 POINTS = list(range(3, 19))
 ADMIN_USER_IDS = [1372450798]  # <-- Thay bằng user_id thật của bạn!
 
+def to_python_type(x):
+    # Chuyển đổi numpy.int64/float64 thành int/float thường, giữ nguyên None hoặc str
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    return x
+
 def create_table():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -53,6 +61,14 @@ def create_table():
         logger.error("DB Error (create_table): %s", e)
 
 def save_prediction(user_id, username, guess_type, guess_points, input_result, input_total, is_bao, is_correct, is_skip, win_streak, switch_cua, ml_pred_type, ml_pred_points):
+    # Chuyển đổi tất cả biến đầu vào sang kiểu python gốc để tránh lỗi numpy.int64 với psycopg2
+    user_id = to_python_type(user_id)
+    input_total = to_python_type(input_total)
+    is_bao = to_python_type(is_bao)
+    is_correct = to_python_type(is_correct)
+    is_skip = to_python_type(is_skip)
+    win_streak = to_python_type(win_streak)
+    switch_cua = to_python_type(switch_cua)
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -391,7 +407,7 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 Bot Sicbo!\n"
+        "👋 Bot Sicbo nhóm tối ưu ML + hành vi!\n"
         "/batdau - Bắt đầu dự đoán mới\n"
         "/thongke - Lịch sử nhóm\n"
         "/reset - Xóa lịch sử cá nhân\n"
@@ -408,7 +424,7 @@ async def thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Chưa có lịch sử nào!"
     else:
         df_valid = df[df["is_skip"] == 0]
-        text = "Lịch sử 10 phiên KHÔNG BỎ QUA gần nhất:\n"
+        text = "Lịch sử 10 phiên KHÔNG BỎ QUA gần nhất của nhóm:\n"
         for idx, row in df_valid.tail(10).iterrows():
             user = row.get("username", "-")
             guess = row.get("guess_type", "-")
