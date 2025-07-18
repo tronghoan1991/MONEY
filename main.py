@@ -386,17 +386,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Nhấn /batdau để bắt đầu dự đoán phiên mới.")
 
-# ==== FASTAPI WEBHOOK ====
+# ==== FASTAPI WEBHOOK & BOT COMMANDS ====
 app = FastAPI()
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
+
 telegram_app.add_handler(CommandHandler("batdau", start_prediction))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+# -- Thêm lệnh /start, /help, /thongke, /reset --
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 Chào mừng bạn đến với bot dự đoán!\n"
+        "Các lệnh hỗ trợ:\n"
+        "/batdau - Bắt đầu dự đoán mới\n"
+        "/thongke - Xem thống kê lịch sử dự đoán\n"
+        "/reset - Xóa toàn bộ lịch sử dự đoán của bạn\n"
+        "/help - Xem hướng dẫn sử dụng\n"
+    )
+    await update.message.reply_text(text)
+
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("help", start))
+
+async def thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    df = fetch_history(limit=1000)
+    df_user = df[df['user_id'] == user_id]
+    total = len(df_user)
+    correct = df_user['is_correct'].sum()
+    text = (
+        f"📊 Thống kê cá nhân:\n"
+        f"- Số phiên nhập: {total}\n"
+        f"- Số lần đúng: {correct}\n"
+        f"- Tỉ lệ đúng: {round(100 * correct / total, 2) if total else 0}%"
+    )
+    await update.message.reply_text(text)
+
+telegram_app.add_handler(CommandHandler("thongke", thongke))
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM history WHERE user_id = %s", (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await update.message.reply_text("✅ Đã xóa lịch sử dự đoán của bạn.")
+    except Exception as e:
+        await update.message.reply_text("Có lỗi khi xóa dữ liệu. Vui lòng thử lại.")
+        logger.error("DB Reset Error: %s", e)
+
+telegram_app.add_handler(CommandHandler("reset", reset))
+
+# -- FIX lỗi initialize --
 @app.on_event("startup")
 async def on_startup():
     logger.info("App starting up, creating DB table & setting webhook.")
     create_table()
+    await telegram_app.initialize()  # Quan trọng!
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
         webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook/{BOT_TOKEN}"
