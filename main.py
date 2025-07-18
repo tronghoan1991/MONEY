@@ -20,6 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 MIN_SESSION_INPUT = 10
 POINTS = list(range(3, 19))
+ADMIN_USER_IDS = [1372450798]  # <-- Thay bằng user_id thật của bạn!
 
 def create_table():
     try:
@@ -57,7 +58,7 @@ def save_prediction(user_id, username, guess_type, guess_points, input_result, i
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO history (user_id, username, guess_type, guess_points, input_result, input_total, is_bao, is_correct, is_skip, win_streak, switch_cua, ml_pred_type, ml_pred_points)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
         """, (user_id, username, guess_type, guess_points, input_result, input_total, is_bao, is_correct, is_skip, win_streak, switch_cua, ml_pred_type, ml_pred_points))
         conn.commit()
         cur.close()
@@ -100,10 +101,12 @@ def make_group_features(df):
 def group_predict(df):
     df = df[df["is_skip"] == 0]
     if len(df) < MIN_SESSION_INPUT:
+        logger.info(f"Chưa đủ {MIN_SESSION_INPUT} phiên hợp lệ để ML dự đoán (đã có {len(df)})")
         return None, None
     X = make_group_features(df)
     y_cua = df["guess_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).shift(-1).dropna()
     if len(y_cua) < 5:
+        logger.info("Chưa đủ dữ liệu để train ML group_predict.")
         return None, None
     X_cua = make_group_features(df.iloc[:-1])
     clf_cua = RandomForestClassifier(n_estimators=30)
@@ -126,6 +129,8 @@ def group_predict(df):
     return cua_text, dai_suggest_str
 
 user_state = {}
+pending_reset = {}
+pending_resetdb = {}
 
 async def start_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -135,15 +140,72 @@ async def start_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("Chọn cửa dự đoán hoặc bỏ qua:", reply_markup=reply_markup)
 
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pending_reset[user_id] = True
+    await update.message.reply_text("Bạn chắc chắn muốn xóa lịch sử cá nhân? Trả lời 'Có' để xác nhận, hoặc gửi bất kỳ tin nhắn nào khác để hủy.")
+
+async def resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("Bạn không có quyền thực hiện thao tác này.")
+        return
+    pending_resetdb[user_id] = True
+    await update.message.reply_text("Bạn chắc chắn muốn xóa toàn bộ lịch sử? Trả lời 'Đồng ý' để xác nhận, hoặc gửi bất kỳ tin nhắn nào khác để hủy.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or f"User{user_id}"
     text = update.message.text.strip()
     state = user_state.get(user_id, {'username': username})
 
+    # Xác nhận reset cá nhân
+    if pending_reset.get(user_id, False):
+        if text.lower() == "có":
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM history WHERE user_id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            await update.message.reply_text("✅ Đã xóa lịch sử dự đoán của bạn.")
+        else:
+            await update.message.reply_text("Đã hủy thao tác xóa lịch sử.")
+        pending_reset[user_id] = False
+        return
+
+    # Xác nhận reset database toàn bộ
+    if pending_resetdb.get(user_id, False):
+        if text.lower() == "đồng ý":
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM history;")
+            conn.commit()
+            cur.close()
+            conn.close()
+            await update.message.reply_text("✅ Đã xóa toàn bộ lịch sử dự đoán!")
+        else:
+            await update.message.reply_text("Đã hủy thao tác xóa toàn bộ lịch sử.")
+        pending_resetdb[user_id] = False
+        return
+
     if state.get('step') == 'choose_type':
         if text == "Bỏ qua phiên này":
-            save_prediction(user_id, username, None, None, None, None, None, None, 1, None, None, "-", "-")
+            save_prediction(
+                user_id=user_id,
+                username=username,
+                guess_type=None,
+                guess_points=None,
+                input_result=None,
+                input_total=None,
+                is_bao=None,
+                is_correct=None,
+                is_skip=1,
+                win_streak=0,
+                switch_cua=0,
+                ml_pred_type="-",
+                ml_pred_points="-"
+            )
             await update.message.reply_text("Bạn đã chọn bỏ qua phiên này. Khi muốn chơi tiếp, nhấn /batdau hoặc đợi phiên tiếp theo.")
             user_state[user_id] = {'step': None, 'username': username}
             return
@@ -161,7 +223,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["Xác nhận", "Bỏ qua"]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True)
-        await update.message.reply_text("Chọn từng điểm dự đoán (bấm từng số, xong thì chọn 'Xác nhận'):", reply_markup=reply_markup)
+        await update.message.reply_text("Chọn các điểm dự đoán (bấm số, tích đủ xong thì chọn 'Xác nhận'):", reply_markup=reply_markup)
         return
 
     if state.get('step') == 'choose_points':
@@ -188,10 +250,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             point = int(text)
             if point in user_state[user_id]['guess_points']:
                 user_state[user_id]['guess_points'].remove(point)
-                await update.message.reply_text(f"Bỏ chọn điểm {point}. Các điểm đã chọn: {sorted(user_state[user_id]['guess_points'])}")
             else:
                 user_state[user_id]['guess_points'].add(point)
-                await update.message.reply_text(f"Đã chọn thêm điểm {point}. Các điểm đã chọn: {sorted(user_state[user_id]['guess_points'])}")
+            # Không gửi tin nhắn sau mỗi lần tích, chỉ cập nhật local.
             return
         else:
             await update.message.reply_text("Hãy bấm số điểm muốn chọn hoặc 'Xác nhận'.")
@@ -261,6 +322,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     ml_text += f"\n• Dải điểm gợi ý: (không xác định)"
                 await update.message.reply_text(ml_text)
+            else:
+                await update.message.reply_text(f"BOT cần nhập đủ {MIN_SESSION_INPUT} phiên KHÔNG bỏ qua để dự đoán ML.")
         except Exception as e:
             logger.error(f"Group ML error: {e}")
 
@@ -292,6 +355,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler("batdau", start_prediction))
+telegram_app.add_handler(CommandHandler("reset", reset))
+telegram_app.add_handler(CommandHandler("resetdb", resetdb))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,6 +365,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/batdau - Bắt đầu dự đoán mới\n"
         "/thongke - Lịch sử nhóm\n"
         "/reset - Xóa lịch sử cá nhân\n"
+        "/resetdb - Xóa toàn bộ lịch sử (admin)\n"
         "/help - Hướng dẫn"
     )
     await update.message.reply_text(text)
@@ -323,20 +389,6 @@ async def thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{user}{skip}, chọn: {guess}, dải: [{dai}], KQ: {kq} (Tổng {total}) - {res}\n"
     await update.message.reply_text(text)
 telegram_app.add_handler(CommandHandler("thongke", thongke))
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM history WHERE user_id = %s", (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text("✅ Đã xóa lịch sử dự đoán của bạn.")
-    except Exception as e:
-        await update.message.reply_text("Có lỗi khi xóa dữ liệu. Vui lòng thử lại.")
-telegram_app.add_handler(CommandHandler("reset", reset))
 
 @app.on_event("startup")
 async def on_startup():
