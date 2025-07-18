@@ -262,11 +262,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             points = sorted(user_state[user_id]['guess_points'])
             if points:
                 await update.message.reply_text(
-                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} các điểm {points}\nNhập kết quả thực tế (vd: 2 4 5):"
+                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} các điểm {points}\nNhập kết quả thực tế (vd: 2 4 5 hoặc 245):"
                 )
             else:
                 await update.message.reply_text(
-                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5):"
+                    f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5 hoặc 245):"
                 )
             logger.info(f"User {user_id} chọn dải điểm: {points}")
             return
@@ -274,7 +274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state[user_id]['guess_points'] = set()
             user_state[user_id]['step'] = 'input_result'
             await update.message.reply_text(
-                f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5):"
+                f"Bạn đã chọn: {user_state[user_id]['guess_type']} (không dải điểm)\nNhập kết quả thực tế (vd: 2 4 5 hoặc 245):"
             )
             logger.info(f"User {user_id} bỏ qua dải điểm.")
             return
@@ -291,10 +291,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Hãy bấm số điểm muốn chọn hoặc 'Xác nhận'.")
             return
 
+    # --- SỬA ĐOẠN NÀY ---
     if state.get('step') == 'input_result':
-        nums = [int(x) for x in text.split() if x.isdigit()]
-        if len(nums) != 3 or not all(1 <= x <= 6 for x in nums):
-            await update.message.reply_text("Vui lòng nhập đúng 3 số từ 1 đến 6 (vd: 2 4 5).")
+        # Cho phép nhập 3 số kiểu liền nhau, cách nhau khoảng trắng, dấu phẩy, dấu gạch
+        cleaned = re.findall(r'\d', text)
+        nums = [int(x) for x in cleaned if 1 <= int(x) <= 6]
+        if len(nums) != 3:
+            await update.message.reply_text("Vui lòng nhập đúng 3 số từ 1 đến 6 (vd: 2 4 5 hoặc 245).")
             logger.warning(f"User {user_id} nhập sai format kết quả: {text}")
             return
         total = sum(nums)
@@ -302,9 +305,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         guess_points = user_state[user_id]['guess_points']
         is_bao = int(nums[0] == nums[1] == nums[2])
         correct = False
+        # Sửa logic kiểm tra đúng/sai
         if guess_type == "Bão":
             correct = is_bao
-        elif guess_points:
+        elif guess_points and len(guess_points) > 0:
             correct = total in guess_points
         else:
             if guess_type == "Tài":
@@ -446,7 +450,7 @@ telegram_app.add_handler(CommandHandler("reset", reset))
 async def on_startup():
     logger.info("App starting up, creating DB table & setting webhook.")
     create_table()
-    await telegram_app.initialize()  # Quan trọng!
+    await telegram_app.initialize()
     webhook_url = os.getenv("WEBHOOK_URL")
     if not webhook_url:
         webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook/{BOT_TOKEN}"
@@ -460,3 +464,8 @@ async def telegram_webhook(request: Request):
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
+
+# -- Chống sleep (UptimeRobot ping) --
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Bot is alive."}
