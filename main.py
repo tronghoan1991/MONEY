@@ -4,17 +4,16 @@ import logging
 import pandas as pd
 import psycopg2
 from sqlalchemy import create_engine
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
-from datetime import datetime
 import joblib
 import re
 import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
 import warnings
@@ -33,7 +32,6 @@ logger.info(f"Starting bot with Python version: {sys.version}")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ROLLING_WINDOW = 12
-MODEL_PATH = "ml_stack_point.joblib"
 MIN_SESSION_INPUT = 10
 POINTS = list(range(3, 19))
 ALPHA = 0.5
@@ -92,15 +90,17 @@ def fetch_history(limit=1000):
         logger.error("DB Fetch Error: %s", e)
         return pd.DataFrame()
 
-# ==== ML + FEATURES ====
-def make_features(df):
-    df = df.copy()
+# ==== FEATURE ENGINEERING (CÁ NHÂN HÓA THỰC SỰ) ====
+def make_personal_features(df_user):
+    df = df_user.copy()
+    df = df.tail(20)  # chỉ lấy 20 phiên gần nhất
+    # 3 số kết quả thực tế
     def extract_numbers(x):
-        if isinstance(x, str) and re.match(r"^\d+\s+\d+\s+\d+$", x):
-            return list(map(int, x.split()))
-        elif isinstance(x, str) and len(x) == 3 and x.isdigit():
-            return [int(x[0]), int(x[1]), int(x[2])]
-        return [0, 0, 0]
+        found = re.findall(r"\d", str(x))
+        arr = [int(i) for i in found if 1 <= int(i) <= 6]
+        while len(arr) < 3:
+            arr.append(0)
+        return arr[:3]
     df[["n1", "n2", "n3"]] = df["input_result"].apply(lambda x: pd.Series(extract_numbers(x)))
     df["total"] = df[["n1", "n2", "n3"]].sum(axis=1)
     df["even"] = df["total"] % 2
@@ -109,117 +109,100 @@ def make_features(df):
     df["xiu"] = (df["total"] <= 10).astype(int)
     df["chan"] = (df["even"] == 0).astype(int)
     df["le"] = (df["even"] == 1).astype(int)
+    # rolling/streak
     for col in ["tai", "xiu", "chan", "le", "bao"]:
-        df[f"{col}_roll"] = df[col].rolling(ROLLING_WINDOW, min_periods=1).mean()
-    for i in range(1, 4):
-        df[f"tai_lag_{i}"] = df["tai"].shift(i)
-        df[f"chan_lag_{i}"] = df["chan"].shift(i)
+        df[f"{col}_roll"] = df[col].rolling(5, min_periods=1).mean()
     def get_streak(arr):
         streaks = [1]
         for i in range(1, len(arr)):
-            if arr[i] == arr[i - 1]:
+            if arr[i] == arr[i-1]:
                 streaks.append(streaks[-1] + 1)
             else:
                 streaks.append(1)
         return streaks
     df["tai_streak"] = get_streak(df["tai"].tolist())
     df["chan_streak"] = get_streak(df["chan"].tolist())
-    return df
-
-def make_user_behavior_features(df):
-    df = df.copy()
-    df["guess_tai"] = (df["guess_type"] == "Tài").astype(int)
-    df["guess_xiu"] = (df["guess_type"] == "Xỉu").astype(int)
-    df["guess_bao"] = (df["guess_type"] == "Bão").astype(int)
-    for pt in range(3, 19):
-        df[f"guess_point_{pt}"] = df["guess_points"].apply(lambda x: str(pt) in str(x).split(","))
-    return df[
-        ["guess_tai", "guess_xiu", "guess_bao"] +
-        [f"guess_point_{pt}" for pt in range(3, 19)]
-    ].astype(int)
-
-FEATURES = [
-    'n1', 'n2', 'n3', 'total', 'even', 'bao',
-    'tai', 'xiu', 'chan', 'le',
-    'tai_roll', 'xiu_roll', 'chan_roll', 'le_roll', 'bao_roll',
-    'tai_lag_1', 'tai_lag_2', 'tai_lag_3',
-    'chan_lag_1', 'chan_lag_2', 'chan_lag_3',
-    'tai_streak', 'chan_streak'
-]
-
-def train_point_model(df, save_path=MODEL_PATH):
-    try:
-        X = df[FEATURES].fillna(0)
-        y = df['total'].astype(int)
-        all_classes = np.arange(3, 19)
-        present_classes = np.unique(y)
-        missing_classes = [c for c in all_classes if c not in present_classes]
-        if missing_classes:
-            X_dummy = pd.DataFrame(0, index=np.arange(len(missing_classes)), columns=FEATURES)
-            y_dummy = pd.Series(missing_classes)
-            X = pd.concat([X, X_dummy], ignore_index=True)
-            y = pd.concat([y, y_dummy], ignore_index=True)
-        le = LabelEncoder()
-        le.fit(all_classes)
-        y_encoded = le.transform(y)
-        models = [
-            ('xgb', xgb.XGBClassifier(n_estimators=60, use_label_encoder=False, eval_metric='mlogloss')),
-            ('rf', RandomForestClassifier(n_estimators=60)),
-            ('lr', LogisticRegression(max_iter=300, multi_class='auto'))
-        ]
-        ensemble = VotingClassifier(estimators=models, voting='soft', n_jobs=-1)
-        ensemble.fit(X, y_encoded)
-        joblib.dump({'ensemble': ensemble, 'label_encoder': le}, save_path)
-        logger.info("Trained & saved main ML model (data rows: %d)", len(df))
-    except Exception as e:
-        logger.error("Train ML model Error: %s", e)
-
-def train_behavior_model(df):
-    try:
-        X = make_user_behavior_features(df)
-        y = df['input_total'].astype(int)
-        all_classes = np.arange(3, 19)
-        le = LabelEncoder()
-        le.fit(all_classes)
-        y_encoded = le.transform(y)
-        models = [
-            ('rf', RandomForestClassifier(n_estimators=40)),
-            ('lr', LogisticRegression(max_iter=200, multi_class='auto'))
-        ]
-        ensemble = VotingClassifier(estimators=models, voting='soft', n_jobs=-1)
-        ensemble.fit(X, y_encoded)
-        logger.info("Trained user-behavior ML model (data rows: %d)", len(df))
-        return ensemble, le
-    except Exception as e:
-        logger.error("Train user-behavior ML Error: %s", e)
-        return None, None
-
-def load_point_model():
-    try:
-        if os.path.exists(MODEL_PATH):
-            obj = joblib.load(MODEL_PATH)
-            if isinstance(obj, dict) and 'ensemble' in obj and 'label_encoder' in obj:
-                return obj['ensemble'], obj['label_encoder']
+    # Hành vi chuyển cửa
+    df["guess_Tai"] = (df["guess_type"] == "Tài").astype(int)
+    df["guess_Xiu"] = (df["guess_type"] == "Xỉu").astype(int)
+    df["guess_Bao"] = (df["guess_type"] == "Bão").astype(int)
+    # Đổi cửa liên tiếp
+    df["switch_cua"] = df["guess_type"] != df["guess_type"].shift(1)
+    # Đúng/Sai
+    df["win"] = df["is_correct"]
+    # Chuỗi thắng/thua
+    def win_streak(arr):
+        streaks = [1]
+        for i in range(1, len(arr)):
+            if arr[i]:
+                streaks.append(streaks[-1] + 1)
             else:
-                return obj, None
-        else:
-            logger.warning("ML model not found.")
-            return None, None
-    except Exception as e:
-        logger.error("Load ML model Error: %s", e)
-        return None, None
+                streaks.append(1)
+        return streaks
+    df["win_streak"] = win_streak(df["win"].tolist())
+    # Tần suất đổi dải
+    df["guess_points_set"] = df["guess_points"].apply(lambda x: tuple(sorted([int(i) for i in str(x).split(",") if i.isdigit()])))
+    df["switch_dai"] = df["guess_points_set"] != df["guess_points_set"].shift(1)
+    # Thắng/thua liên tiếp
+    win_count = (df["is_correct"] == 1).sum()
+    lose_count = (df["is_correct"] == 0).sum()
+    # Các đặc trưng tổng hợp:
+    features = {
+        "tai_rate": df["tai"].mean(),
+        "xiu_rate": df["xiu"].mean(),
+        "bao_rate": df["bao"].mean(),
+        "chan_rate": df["chan"].mean(),
+        "le_rate": df["le"].mean(),
+        "switch_cua_rate": df["switch_cua"].mean(),
+        "switch_dai_rate": df["switch_dai"].mean(),
+        "win_rate": win_count / (win_count + lose_count + 1e-5),
+        "mean_total": df["total"].mean(),
+        "std_total": df["total"].std(),
+        "last_tai": df["tai"].iloc[-1],
+        "last_xiu": df["xiu"].iloc[-1],
+        "last_bao": df["bao"].iloc[-1],
+        "last_win": df["win"].iloc[-1],
+        "win_streak": df["win_streak"].iloc[-1],
+        "tai_streak": df["tai_streak"].iloc[-1],
+        "chan_streak": df["chan_streak"].iloc[-1],
+    }
+    return pd.DataFrame([features])
 
-def suggest_best_range_point(pred_prob_dict, from_num, to_num, length=3):
-    best_range = (from_num, from_num+length-1)
-    keys = list(range(from_num, to_num+1))
-    vals = [pred_prob_dict.get(k, 0) for k in keys]
-    best_sum = sum(vals[:length])
-    for i in range(0, len(vals)-length+1):
-        curr_sum = sum(vals[i:i+length])
-        if curr_sum > best_sum:
-            best_sum = curr_sum
-            best_range = (keys[i], keys[i+length-1])
-    return best_range
+# ==== ML: PERSONAL PREDICT ====
+def personal_predict(df_user):
+    # Nếu chưa đủ 10 phiên, không dự đoán
+    if len(df_user) < MIN_SESSION_INPUT:
+        return None, None
+    X = make_personal_features(df_user)
+    # Dự đoán cửa (Tài/Xỉu/Bão)
+    # Dùng RF, dễ train nhanh
+    y_cua = df_user["guess_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).shift(-1).dropna()
+    if len(y_cua) < 5:
+        return None, None
+    X_cua = make_personal_features(df_user.iloc[:-1])
+    clf_cua = RandomForestClassifier(n_estimators=40)
+    clf_cua.fit(X_cua, y_cua)
+    y_pred_cua = clf_cua.predict(X)[0]
+    cua_text = ["Tài", "Xỉu", "Bão"][int(y_pred_cua)]
+
+    # Dự đoán dải điểm: Lấy dải điểm bạn thường chọn khi thắng, và gợi ý trung bình
+    win_rows = df_user[df_user["is_correct"] == 1]
+    if not win_rows.empty:
+        dai_freq = {}
+        for dai in win_rows["guess_points"]:
+            if not dai: continue
+            for i in dai.split(","):
+                if i.isdigit():
+                    dai_freq[int(i)] = dai_freq.get(int(i), 0) + 1
+        top_dai = sorted(dai_freq.items(), key=lambda x: -x[1])[:3]
+        dai_suggest = [str(d[0]) for d in top_dai]
+        if dai_suggest:
+            dai_suggest_str = ", ".join(dai_suggest)
+        else:
+            dai_suggest_str = ""
+    else:
+        dai_suggest_str = ""
+    return cua_text, dai_suggest_str
 
 # ==== BOT FLOW ====
 user_state = {}
@@ -291,9 +274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Hãy bấm số điểm muốn chọn hoặc 'Xác nhận'.")
             return
 
-    # --- SỬA ĐOẠN NÀY ---
     if state.get('step') == 'input_result':
-        # Cho phép nhập 3 số kiểu liền nhau, cách nhau khoảng trắng, dấu phẩy, dấu gạch
         cleaned = re.findall(r'\d', text)
         nums = [int(x) for x in cleaned if 1 <= int(x) <= 6]
         if len(nums) != 3:
@@ -304,66 +285,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         guess_type = user_state[user_id]['guess_type']
         guess_points = user_state[user_id]['guess_points']
         is_bao = int(nums[0] == nums[1] == nums[2])
-        correct = False
-        # Sửa logic kiểm tra đúng/sai
-        if guess_type == "Bão":
-            correct = is_bao
-        elif guess_points and len(guess_points) > 0:
-            correct = total in guess_points
+
+        # Xác định kết quả cửa
+        if guess_type == "Tài":
+            is_cua = 11 <= total <= 18
+            cua_text = "Tài"
+        elif guess_type == "Xỉu":
+            is_cua = 3 <= total <= 10
+            cua_text = "Xỉu"
+        elif guess_type == "Bão":
+            is_cua = is_bao == 1
+            cua_text = "Bão"
         else:
-            if guess_type == "Tài":
-                correct = 11 <= total <= 18
-            elif guess_type == "Xỉu":
-                correct = 3 <= total <= 10
+            is_cua = False
+            cua_text = guess_type
 
-        kq_text = f"Kết quả: {nums[0]} {nums[1]} {nums[2]} (Tổng {total})"
-        logger.info(f"User {user_id} nhập kết quả: {nums}, dự đoán {guess_type}, {guess_points}, đúng: {correct}")
+        # Xác định kết quả dải số (nếu có chọn)
+        if guess_points and len(guess_points) > 0:
+            is_dai = total in guess_points
+            dai_text = f"[{', '.join(str(x) for x in sorted(guess_points))}]"
+        else:
+            is_dai = None
+            dai_text = None
 
-        # ==== ML 2 nguồn ====
-        df = fetch_history(limit=1000)
-        ml_pred_type, ml_pred_points = "-", "-"
+        # ĐÚNG/SAI tổng thể: chỉ tính đúng nếu đúng cả 2
+        if guess_type == "Bão":
+            correct = is_cua
+        elif guess_points and len(guess_points) > 0:
+            correct = is_dai
+        else:
+            correct = is_cua
+
+        kq_text = f"Kết quả: {nums[0]} {nums[1]} {nums[2]} (Tổng {total})\n"
+        kq_text += f"Kết quả cửa: {cua_text} ({'ĐÚNG' if is_cua else 'SAI'})\n"
+        if dai_text is not None:
+            kq_text += f"Kết quả dải số: {dai_text} ({'ĐÚNG' if is_dai else 'SAI'})"
+
+        # ML CÁ NHÂN HÓA
+        df_all = fetch_history(limit=1000)
+        df_user = df_all[df_all['user_id'] == user_id]
         try:
-            if len(df) >= MIN_SESSION_INPUT:
-                df_feat = make_features(df)
-                if not os.path.exists(MODEL_PATH) or len(df_feat) % 50 == 0:
-                    train_point_model(df_feat)
-                ensemble, le = joblib.load(MODEL_PATH).values()
-                X_pred = make_features(df.tail(ROLLING_WINDOW)).iloc[[-1]][FEATURES].fillna(0)
-                proba1 = None
-                if ensemble is not None:
-                    proba_all = ensemble.predict_proba(X_pred)[0]
-                    classes = le.inverse_transform(np.arange(len(proba_all)))
-                    prob_dict_1 = {int(cls): float(prob) for cls, prob in zip(classes, proba_all)}
-                    for pt in POINTS:
-                        if pt not in prob_dict_1:
-                            prob_dict_1[pt] = 0.0
-                    proba1 = prob_dict_1
-                behavior_model, behavior_le = train_behavior_model(df)
-                proba2 = {pt: 0.0 for pt in POINTS}
-                if behavior_model is not None:
-                    X_user = make_user_behavior_features(df.tail(1))
-                    proba_all2 = behavior_model.predict_proba(X_user)[0]
-                    classes2 = behavior_le.inverse_transform(np.arange(len(proba_all2)))
-                    prob_dict_2 = {int(cls): float(prob) for cls, prob in zip(classes2, proba_all2)}
-                    for pt in POINTS:
-                        if pt not in prob_dict_2:
-                            prob_dict_2[pt] = 0.0
-                    proba2 = prob_dict_2
-                final_prob = {pt: ALPHA * proba1.get(pt, 0) + (1 - ALPHA) * proba2.get(pt, 0) for pt in POINTS}
-                prob_tai = sum([final_prob.get(pt, 0) for pt in range(11, 19)])
-                prob_xiu = sum([final_prob.get(pt, 0) for pt in range(3, 11)])
-                ml_pred_type = "Tài" if prob_tai > prob_xiu else "Xỉu"
-                g_range = suggest_best_range_point(final_prob, 3, 18, length=3)
-                ml_pred_points = f"{g_range[0]}-{g_range[1]}"
-                await update.message.reply_text(
-                    f"🤖 BOT (cá nhân hóa + dữ liệu thực tế) dự đoán phiên tiếp:\n• Cửa: {ml_pred_type}\n• Dải điểm: {ml_pred_points}"
-                )
-                logger.info(f"ML prediction (type: {ml_pred_type}, range: {ml_pred_points})")
-            else:
-                await update.message.reply_text("BOT cần tối thiểu 10 phiên để dự đoán ML.")
-                logger.info(f"Chưa đủ phiên để ML predict ({len(df)} phiên).")
+            if len(df_user) >= MIN_SESSION_INPUT:
+                cua_pred, dai_pred = personal_predict(df_user)
+                if cua_pred:
+                    ml_text = f"\n🤖 BOT dự đoán phiên tiếp:\n• Cửa: {cua_pred}"
+                    if dai_pred:
+                        ml_text += f"\n• Dải điểm gợi ý: {dai_pred}"
+                    else:
+                        ml_text += f"\n• Dải điểm gợi ý: (không xác định)"
+                    await update.message.reply_text(ml_text)
         except Exception as e:
-            logger.error(f"ML prediction error: {e}")
+            logger.error(f"Personal ML error: {e}")
 
         save_prediction(
             user_id=user_id,
@@ -373,15 +345,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             input_total=total,
             is_bao=is_bao,
             is_correct=int(correct),
-            ml_pred_type=ml_pred_type,
-            ml_pred_points=ml_pred_points
+            ml_pred_type=cua_pred if 'cua_pred' in locals() else "-",
+            ml_pred_points=dai_pred if 'dai_pred' in locals() else "-"
         )
 
-        if correct:
-            await update.message.reply_text(f"✅ Đúng! {kq_text}")
-        else:
-            await update.message.reply_text(f"❌ Sai! {kq_text}")
-
+        await update.message.reply_text(kq_text)
         user_state[user_id] = {'step': 'choose_type'}
         keyboard = [["Tài", "Xỉu", "Bão"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -401,7 +369,7 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_
 # -- Thêm lệnh /start, /help, /thongke, /reset --
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 Chào mừng bạn đến với bot dự đoán!\n"
+        "👋 Chào mừng bạn đến với bot dự đoán cá nhân hóa!\n"
         "Các lệnh hỗ trợ:\n"
         "/batdau - Bắt đầu dự đoán mới\n"
         "/thongke - Xem thống kê lịch sử dự đoán\n"
@@ -465,7 +433,11 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return {"ok": True}
 
-# -- Chống sleep (UptimeRobot ping) --
+# -- Chống sleep (UptimeRobot ping) + fix HEAD 405 --
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Bot is alive."}
+
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
