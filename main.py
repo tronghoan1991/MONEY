@@ -138,6 +138,18 @@ def group_predict(df):
     dai_suggest_str = ", ".join(dai_suggest) if dai_suggest else ""
     return cua_text, dai_suggest_str
 
+# ------------------ Thêm hàm xác định kết quả thực tế ------------------
+def get_result_type(row):
+    if row["is_bao"] == 1:
+        return "Bão"
+    elif 11 <= row["input_total"] <= 18:
+        return "Tài"
+    elif 3 <= row["input_total"] <= 10:
+        return "Xỉu"
+    else:
+        return None
+# -----------------------------------------------------------------------
+
 user_state = {}
 pending_reset = {}
 pending_resetdb = {}
@@ -354,13 +366,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(kq_text)
 
-        # ====== Thống kê đúng/sai của người chơi và ML nhóm ======
+        # ====== Thống kê đúng/sai của người chơi và ML nhóm (ĐÃ SỬA ĐÚNG) ======
         user_history = df_all[(df_all["user_id"] == user_id) & (df_all["is_skip"] == 0)]
         total_user = len(user_history)
         right_user = user_history["is_correct"].sum()
         user_right_pct = round(right_user / total_user * 100, 1) if total_user else 0
 
         df_ml = df_all[df_all["is_skip"] == 0].reset_index(drop=True)
+        # ---- Thêm cột result_type (kết quả thực tế) ----
+        if not df_ml.empty:
+            df_ml["result_type"] = df_ml.apply(get_result_type, axis=1)
         ml_total = 0
         ml_right = 0
 
@@ -373,7 +388,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 clf_cua = RandomForestClassifier(n_estimators=30)
                 clf_cua.fit(X_train.iloc[:-1], y_train)
                 X_pred = X_train.iloc[[-1]]
-                y_true = df_ml["guess_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).iloc[i]
+                # ---- SỬA: lấy y_true là kết quả thực tế, không phải dự đoán của người chơi ----
+                y_true = df_ml["result_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).iloc[i]
                 y_pred = clf_cua.predict(X_pred)[0]
                 if y_true in [0, 1, 2]:
                     ml_total += 1
