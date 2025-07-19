@@ -304,14 +304,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_dai = None
             dai_text = None
 
-        # ==== CHỈ CẦN DÒNG NÀY ====
         correct = is_cua
-        # ==========================
 
-        df_all = fetch_history(limit=1000)
-        df = df_all[df_all["is_skip"] == 0]
         win_streak = 1
         switch_cua = 0
+        # Phải lưu bản ghi trước, rồi mới fetch_history để thống kê luôn đúng!
+        save_prediction(
+            user_id=user_id,
+            username=username,
+            guess_type=guess_type,
+            guess_points=",".join(str(p) for p in sorted(guess_points)) if guess_points else "",
+            input_result=" ".join(str(x) for x in nums),
+            input_total=total,
+            is_bao=is_bao,
+            is_correct=int(correct),
+            is_skip=0,
+            win_streak=win_streak,
+            switch_cua=switch_cua,
+            ml_pred_type="-",
+            ml_pred_points="-"
+        )
+
+        # Lấy lại lịch sử sau khi đã lưu bản ghi này!
+        df_all = fetch_history(limit=1000)
+        df = df_all[df_all["is_skip"] == 0]
         if not df.empty:
             if df["is_correct"].iloc[-1] == 1:
                 win_streak = (df["is_correct"] == 1).astype(int).groupby((df["is_correct"] != 1).cumsum()).cumcount().iloc[-1] + 1
@@ -338,24 +354,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"BOT cần nhập đủ {MIN_SESSION_INPUT} phiên KHÔNG bỏ qua để dự đoán ML (hiện tại có {valid_sessions}).")
         except Exception as e:
             logger.error(f"Group ML error: {e}")
-
-        save_prediction(
-            user_id=user_id,
-            username=username,
-            guess_type=guess_type,
-            guess_points=",".join(str(p) for p in sorted(guess_points)) if guess_points else "",
-            input_result=" ".join(str(x) for x in nums),
-            input_total=total,
-            is_bao=is_bao,
-            is_correct=int(correct),
-            is_skip=0,
-            win_streak=win_streak,
-            switch_cua=switch_cua,
-            ml_pred_type=cua_pred if 'cua_pred' in locals() else "-",
-            ml_pred_points=dai_pred if 'dai_pred' in locals() else "-"
-        )
-
-        await update.message.reply_text(kq_text)
 
         user_history = df_all[(df_all["user_id"] == user_id) & (df_all["is_skip"] == 0)]
         total_user = len(user_history)
@@ -391,6 +389,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Bạn: dự đoán {right_user}/{total_user} phiên đúng ({user_right_pct}%)\n"
             f"• ML nhóm: dự đoán {ml_right}/{ml_total} phiên đúng ({ml_right_pct}%)"
         )
+        await update.message.reply_text(kq_text)
         await update.message.reply_text(stats_text)
 
         user_state[user_id] = {'step': 'choose_type', 'username': username}
