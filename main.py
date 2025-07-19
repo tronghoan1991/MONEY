@@ -23,7 +23,6 @@ POINTS = list(range(3, 19))
 ADMIN_USER_IDS = [1372450798]  # <-- Thay bằng user_id thật của bạn!
 
 def to_python_type(x):
-    # Chuyển đổi numpy.int64/float64 thành int/float thường, giữ nguyên None hoặc str
     if isinstance(x, (np.integer,)):
         return int(x)
     if isinstance(x, (np.floating,)):
@@ -61,7 +60,6 @@ def create_table():
         logger.error("DB Error (create_table): %s", e)
 
 def save_prediction(user_id, username, guess_type, guess_points, input_result, input_total, is_bao, is_correct, is_skip, win_streak, switch_cua, ml_pred_type, ml_pred_points):
-    # Chuyển đổi tất cả biến đầu vào sang kiểu python gốc để tránh lỗi numpy.int64 với psycopg2
     user_id = to_python_type(user_id)
     input_total = to_python_type(input_total)
     is_bao = to_python_type(is_bao)
@@ -138,7 +136,6 @@ def group_predict(df):
     dai_suggest_str = ", ".join(dai_suggest) if dai_suggest else ""
     return cua_text, dai_suggest_str
 
-# ------------------ Thêm hàm xác định kết quả thực tế ------------------
 def get_result_type(row):
     if row["is_bao"] == 1:
         return "Bão"
@@ -148,7 +145,6 @@ def get_result_type(row):
         return "Xỉu"
     else:
         return None
-# -----------------------------------------------------------------------
 
 user_state = {}
 pending_reset = {}
@@ -181,7 +177,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     state = user_state.get(user_id, {'username': username})
 
-    # Xác nhận reset cá nhân
     if pending_reset.get(user_id, False):
         if text.lower() == "có":
             conn = psycopg2.connect(DATABASE_URL)
@@ -196,7 +191,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_reset[user_id] = False
         return
 
-    # Xác nhận reset database toàn bộ
     if pending_resetdb.get(user_id, False):
         if text.lower() == "đồng ý":
             conn = psycopg2.connect(DATABASE_URL)
@@ -310,12 +304,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_dai = None
             dai_text = None
 
-        if guess_type == "Bão":
-            correct = is_cua
-        elif guess_points and len(guess_points) > 0:
-            correct = is_dai
-        else:
-            correct = is_cua
+        # ==== CHỈ CẦN DÒNG NÀY ====
+        correct = is_cua
+        # ==========================
 
         df_all = fetch_history(limit=1000)
         df = df_all[df_all["is_skip"] == 0]
@@ -366,14 +357,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(kq_text)
 
-        # ====== Thống kê đúng/sai của người chơi và ML nhóm (ĐÃ SỬA ĐÚNG) ======
         user_history = df_all[(df_all["user_id"] == user_id) & (df_all["is_skip"] == 0)]
         total_user = len(user_history)
         right_user = user_history["is_correct"].sum()
         user_right_pct = round(right_user / total_user * 100, 1) if total_user else 0
 
         df_ml = df_all[df_all["is_skip"] == 0].reset_index(drop=True)
-        # ---- Thêm cột result_type (kết quả thực tế) ----
         if not df_ml.empty:
             df_ml["result_type"] = df_ml.apply(get_result_type, axis=1)
         ml_total = 0
@@ -388,7 +377,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 clf_cua = RandomForestClassifier(n_estimators=30)
                 clf_cua.fit(X_train.iloc[:-1], y_train)
                 X_pred = X_train.iloc[[-1]]
-                # ---- SỬA: lấy y_true là kết quả thực tế, không phải dự đoán của người chơi ----
                 y_true = df_ml["result_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).iloc[i]
                 y_pred = clf_cua.predict(X_pred)[0]
                 if y_true in [0, 1, 2]:
@@ -404,7 +392,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• ML nhóm: dự đoán {ml_right}/{ml_total} phiên đúng ({ml_right_pct}%)"
         )
         await update.message.reply_text(stats_text)
-        # ====== Hết thống kê ======
 
         user_state[user_id] = {'step': 'choose_type', 'username': username}
         keyboard = [["Tài", "Xỉu", "Bão"], ["Bỏ qua phiên này"]]
