@@ -109,6 +109,16 @@ def make_group_features(df):
     })
     return features
 
+def get_result_type(row):
+    if row["is_bao"] == 1:
+        return "Bão"
+    elif 11 <= row["input_total"] <= 18:
+        return "Tài"
+    elif 3 <= row["input_total"] <= 10:
+        return "Xỉu"
+    else:
+        return None
+
 def group_predict(df):
     df = df[df["is_skip"] == 0].reset_index(drop=True)
     if len(df) < MIN_SESSION_INPUT:
@@ -124,7 +134,9 @@ def group_predict(df):
     X_pred = make_group_features(df).iloc[[-1]]
     y_pred_cua = clf_cua.predict(X_pred)[0]
     cua_text = ["Tài", "Xỉu", "Bão"][int(y_pred_cua)]
-    win_rows = df[df["is_correct"] == 1]
+    # ----------- FIX DẢI ĐIỂM GỢI Ý ĐÚNG CỬA -----------
+    cua_pred_num = {"Tài": 0, "Xỉu": 1, "Bão": 2}[cua_text]
+    win_rows = df[(df["is_correct"] == 1) & (df["guess_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}) == cua_pred_num)]
     dai_freq = {}
     for dai in win_rows["guess_points"]:
         if not dai: continue
@@ -135,16 +147,6 @@ def group_predict(df):
     dai_suggest = [str(d[0]) for d in top_dai]
     dai_suggest_str = ", ".join(dai_suggest) if dai_suggest else ""
     return cua_text, dai_suggest_str
-
-def get_result_type(row):
-    if row["is_bao"] == 1:
-        return "Bão"
-    elif 11 <= row["input_total"] <= 18:
-        return "Tài"
-    elif 3 <= row["input_total"] <= 10:
-        return "Xỉu"
-    else:
-        return None
 
 user_state = {}
 pending_reset = {}
@@ -308,7 +310,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         win_streak = 1
         switch_cua = 0
-        # Phải lưu bản ghi trước, rồi mới fetch_history để thống kê luôn đúng!
         save_prediction(
             user_id=user_id,
             username=username,
@@ -325,7 +326,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ml_pred_points="-"
         )
 
-        # Lấy lại lịch sử sau khi đã lưu bản ghi này!
         df_all = fetch_history(limit=1000)
         df = df_all[df_all["is_skip"] == 0]
         if not df.empty:
@@ -355,6 +355,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Group ML error: {e}")
 
+        # ---- FIX THỐNG KÊ ML ĐÚNG SỐ PHIÊN, KHÔNG TRỄ ----
         user_history = df_all[(df_all["user_id"] == user_id) & (df_all["is_skip"] == 0)]
         total_user = len(user_history)
         right_user = user_history["is_correct"].sum()
@@ -367,14 +368,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ml_right = 0
 
         if len(df_ml) > MIN_SESSION_INPUT:
-            for i in range(MIN_SESSION_INPUT, len(df_ml)-1):
+            for i in range(MIN_SESSION_INPUT, len(df_ml)):
                 X_train = make_group_features(df_ml.iloc[:i])
-                y_train = df_ml["guess_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).shift(-1).iloc[:i-1].dropna()
-                if len(X_train) < 2 or len(y_train) != len(X_train.iloc[:-1]):
+                y_train = df_ml["result_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).iloc[:i]
+                if len(X_train) < 2 or len(y_train) != len(X_train):
                     continue
                 clf_cua = RandomForestClassifier(n_estimators=30)
-                clf_cua.fit(X_train.iloc[:-1], y_train)
-                X_pred = X_train.iloc[[-1]]
+                clf_cua.fit(X_train, y_train)
+                X_pred = make_group_features(df_ml.iloc[:i+1]).iloc[[-1]]
                 y_true = df_ml["result_type"].replace({"Tài": 0, "Xỉu": 1, "Bão": 2}).iloc[i]
                 y_pred = clf_cua.predict(X_pred)[0]
                 if y_true in [0, 1, 2]:
